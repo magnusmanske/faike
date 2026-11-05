@@ -20,8 +20,9 @@ cargo run --release -- run config.json
 
 `run` starts the watcher and the web server in one process. `watch` runs only the
 watcher (for a bot process), and `serve` serves the UI from an existing store and
-reloads it every five seconds. The JSONL store is single-writer: the bot owns the
-writer, the web service opens it read-only.
+reloads it every five seconds. Detections go to the configured `store`: a local
+JSONL file (single writer) or the tool's ToolsDB database (shared by the bot and
+the web service).
 
 Analyse a local file without the watcher:
 
@@ -74,7 +75,7 @@ flowchart TD
     E --> G[detectors]
     F --> G
     G --> H[score + dedupe by SHA-1]
-    H --> I[JSONL store + cursor]
+    H --> I[(detection store<br/>JSONL or ToolsDB)]
     I --> J[axum UI / JSON API]
     I --> K[AbuseFilter export]
 ```
@@ -86,16 +87,16 @@ flowchart TD
   `container`, `description`, and `watermark` (`dwt_dct`, `trustmark`).
 - `src/patterns.rs` — single source of truth for vendor names, prompt markers,
   AI phrases, wikitext templates, and the AbuseFilter regexes.
-- `src/store.rs` — append-only JSONL + in-memory ring; cursor in a small JSON
-  file.
+- `src/store/` — `Store` dispatches between the JSONL backend (`file.rs`) and
+  the ToolsDB backend (`toolsdb.rs`); both share the in-memory ring in `mod.rs`.
 - `src/web.rs` — server-rendered UI, `/api/detections`, `/api/status`,
   `/abuse-filters`, `/abuse-filters.json`, `/healthz`.
 - `src/abuse_filter.rs` — generates paste-ready rules.
 
-The process runs the watcher and web server together. This keeps the MVP to one
-binary and one store. On Toolforge, `Procfile` runs them as separate processes:
-the bot owns the JSONL writer, and `serve` opens it read-only and reloads it. A
-future ToolsDB store removes the single-writer limitation.
+The process runs the watcher and web server together. On Toolforge, `Procfile`
+runs them as separate processes. With ToolsDB both read the same database: the
+bot writes to the primary, `serve` reads the replica and reloads every five
+seconds. SQLite-style single-writer caveats do not apply.
 
 ## AbuseFilter output
 
@@ -158,7 +159,7 @@ Considered but not used:
 | `little_exif` | MIT | Read/write EXIF; writing is not needed. |
 | `mediawiki` | MIT/Apache-2.0 | Action API builders; this tool needs `loginfo`, `extmetadata`, a custom cursor, and retry behaviour, so it uses a small direct client inspired by `wdrc_rs`. |
 | `wikimisc` | (git, project license) | Useful Toolforge/server helpers; not required for the standalone MVP. |
-| `toolforge` | MIT/Apache-2.0 | ToolsDB pools and deployment helpers; use when the store moves to ToolsDB. |
+| `toolforge` | MIT/Apache-2.0 | ToolsDB pools, credential lookup and `toolforge-tunnel`; used by the ToolsDB store. |
 
 Other-language/ecosystem options worth translating or wrapping:
 
@@ -191,16 +192,26 @@ and the TrustMark decoder result. It uses `config.json` or `AIMER_CONFIG` for
 model paths and thresholds.
 
 Defaults were calibrated on a small local corpus (PNG and JPEG maps, photos,
-noise, gradients, a C2PA sample, and Python `invisible-watermark` encodes):
+noise, gradients, a C2PA sample, and Python `invisible-watermark` encodes) and
+on 75 files from the Commons `AI-generated_media` subcategories:
 
 - `dwt_match_threshold = 0.85`: genuine `StableDiffusionV1`/`SDV1` PNG encodes
-  matched 100% of payload bits; ordinary images matched ~0.5–0.63.
-- `dwt_margin_threshold = 0.35`: genuine PNG encodes were 0.38–0.46;
-  ordinary images were 0.03–0.20.
-- `dwt_generic_margin_threshold = 0.60`: unknown payloads must be very stable.
-- `dwt_lock_threshold = 0.60`: genuine encodes were ~0.65–0.66; ordinary
-  images were ~0.45–0.57. This guard is essential: a constant or JPEG-flattened
-  image produces unanimous zero bits (margin 1.0) without any watermark.
+  matched 97–100% of payload bits; ordinary images matched ~0.5–0.63.
+- `dwt_margin_threshold = 0.35`: genuine PNG encodes were 0.46–0.93; ordinary
+  images were 0.03–0.45.
+- `dwt_generic_margin_threshold = 0.80`: an unknown-periodicity mark is weak
+  evidence, and flat graphics (charts, logos) can produce a stable-looking
+  signal. At 0.80, none of the 75 Commons files passes together with the lock
+  threshold.
+- `dwt_lock_threshold = 0.60`: genuine encodes were 0.66–0.84; ordinary images
+  were ~0.45. This guard is essential: a constant or JPEG-flattened image
+  produces unanimous zero bits (margin 1.0) without any watermark.
+
+The reference `invisible-watermark` encoder only marks the U channel (its
+`scales` list suggests U and V, but the loop covers channels 0–1), and OpenCV
+rounds YUV to 8 bits before the DWT. The Rust decoder matches both details;
+scanning V as well, or keeping fractional U values, diluted or shifted the bit
+votes.
 
 Known limitations:
 
@@ -226,7 +237,13 @@ See `config.json.template`. Key points:
   metadata/wikitext analysis.
 - `max_download_bytes` bounds memory and bandwidth; oversized files are
   metadata-only.
-- `store_file` and `cursor_file` must be on persistent storage on Toolforge.
+- `store` selects where detections go. `kind: "file"` uses `file` and
+  `cursor_file`, which must be on persistent storage on Toolforge. `kind:
+  "toolsdb"` uses the tool's database: an empty `database` derives
+  `<tool user>__faike_p`. `replica_my_cnf` is left `null` on Toolforge, where the
+  `toolforge` crate finds the credentials itself; locally point it at a copy with
+  `local = 'true'` and run `toolforge-tunnel`. `pool_max`, `connect_timeout_sec`
+  and `max_statement_time_sec` follow the Toolforge connection policy.
 - The default `web_address` is loopback. Set `0.0.0.0` (or use
   `$AIMER_ADDRESS`) on Toolforge; `$AIMER_PORT` overrides the port.
 - The watcher is polite: one recent-changes poll at a time, batched imageinfo
@@ -234,7 +251,7 @@ See `config.json.template`. Key points:
   retries with `Retry-After` on 429/5xx.
 - Watermark analysis is controlled by `detect.watermark`. `models_dir` points at
   the directory populated by `scripts/fetch-models.sh`; on Toolforge use a
-  persistent path such as `/data/project/aimer/models`. TrustMark is disabled
+  persistent path such as `/data/project/faike/models`. TrustMark is disabled
   cleanly if the models are absent. The ONNX Runtime is statically linked, so
   no separate shared library is needed at runtime, but builds are larger and
   slower.
@@ -256,37 +273,54 @@ cargo fmt --check
 Tests cover the detector parsers with synthetic PNG/XMP/EXIF data, scoring,
 watermark DWT-DCT round-trips (including JPEG/constant-image false-positive
 guards), the optional TrustMark round-trip when models are present, AbuseFilter
-escaping/chunking, the store/cursor and read-only reload, the recent-changes
+escaping/chunking, both store backends and read-only reload, the recent-changes
 parser, and the web routes (including HTML escaping). `AIMER_DEBUG=1` prints
 per-detector timings and per-file progress.
 
+`tests/corpus.rs` runs the built binary over seven permanent fixtures in
+`tests/fixtures/`: five unmodified Commons AI-media uploads (C2PA, XMP and EXIF
+signals), one ordinary photo as a negative control, and one synthetic
+`invisible-watermark` PNG. Attribution and licences are in
+`tests/fixtures/README.md`.
+
+The ToolsDB round-trip is opt-in because it needs the tunnel and credentials:
+
+```bash
+AIMER_TOOLSDB_TEST=1 cargo test -- --ignored
+```
+
 ## Toolforge deployment
 
-`Procfile` assumes the tool account is `aimer` and the config is at
-`/data/project/aimer/config.json`:
+`Procfile` assumes the Toolforge tool account is `faike` and the config is at
+`/data/project/faike/config.json`:
 
 ```procfile
-web: AIMER_PORT=$PORT ./target/release/aimer serve /data/project/aimer/config.json
-bot: ./target/release/aimer watch /data/project/aimer/config.json
+web: AIMER_PORT=$PORT ./target/release/aimer serve /data/project/faike/config.json
+bot: ./target/release/aimer watch /data/project/faike/config.json
 ```
 
 Prepare the persistent paths once on the tool account:
 
 ```bash
-mkdir -p /data/project/aimer/models
-scripts/fetch-models.sh /data/project/aimer/models
-# In /data/project/aimer/config.json:
+mkdir -p /data/project/faike/models
+scripts/fetch-models.sh /data/project/faike/models
+# In /data/project/faike/config.json:
 #   "web_address": "0.0.0.0"
-#   "store_file": "/data/project/aimer/detections.jsonl"
-#   "cursor_file": "/data/project/aimer/cursor.json"
-#   "detect": {"watermark": {"models_dir": "/data/project/aimer/models"}}
+#   "store": {"kind": "toolsdb", "database": "s58339__faike_p"}
+#   "detect": {"watermark": {"models_dir": "/data/project/faike/models"}}
 ```
 
+The database (`s58339__faike_p`) and its tables are created on first start by
+either process (`CREATE ... IF NOT EXISTS`), so a fresh deployment needs no
+manual SQL. The schema is `detections` (one row per detection; indexed by
+`timestamp`, `(score, timestamp)` and `sha1`) and `meta` (the recent-changes
+cursor).
+
 Start/restart the web service with the build-service image, then run
-`./restart.sh` for the bot job. The web service opens the JSONL store read-only
-and reloads it every five seconds; the bot is the only writer. The models and
-ONNX Runtime are large, so the build and image are larger than a metadata-only
-deployment. Typical first launch:
+`./restart.sh` for the bot job. The web service reads the ToolsDB replica and
+reloads every five seconds, so it does not compete with the bot for the primary.
+The models and ONNX Runtime are large, so the build and image are larger than a
+metadata-only deployment. Typical first launch:
 
 ```bash
 toolforge webservice buildservice start --mount=all --health-check-path /healthz
@@ -305,7 +339,7 @@ works and TrustMark is skipped.
 3. Optional neural classifiers, clearly labelled probabilistic and never used
    for `disallow`.
 4. Video/audio: sample frames/audio, reuse the image/watermark detectors.
-5. ToolsDB storage, multiple watchers, a public report page, and an on-wiki bot
-   mode that tags/notifies.
+5. Multiple watchers, a public report page, and an on-wiki bot mode that
+   tags/notifies.
 6. C2PA trust-list validation and trust-state display (currently only
    cryptographic validity is reported; no trust anchors are configured).

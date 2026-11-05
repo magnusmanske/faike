@@ -2,9 +2,13 @@
 //!
 //! This follows the `dwtDct` decoder in ShieldMnt's `invisible-watermark`
 //! (MIT): the image is converted to YUV, a one-level Haar DWT is applied to the
-//! U and V planes, and the magnitude of the largest non-DC coefficient in each
-//! 4×4 LL block votes for one payload bit. The vote is taken modulo the payload
+//! U plane, and the magnitude of the largest non-DC coefficient in each 4×4 LL
+//! block votes for one payload bit. The vote is taken modulo the payload
 //! length, so an unknown-length mark can still be measured by bit stability.
+//!
+//! The encoder passes `scales=[0, 36, 36]` but loops over channels `0..2`, so
+//! only channel 1 (U) is actually marked. Scanning V as well would add
+//! unwatermarked content and dilute the votes, so we match the encoder.
 //!
 //! The original Stable Diffusion v1 pipeline embedded the ASCII payload
 //! `StableDiffusionV1` (136 bits); other tools use different payloads. We test a
@@ -232,8 +236,7 @@ pub fn detect(image: &RgbImage, config: &WatermarkConfig) -> Vec<Signal> {
     signals
 }
 
-/// Block votes for U and V, in the order the Python implementation processes
-/// them (all U blocks, then all V blocks, each restarting at block zero).
+/// Block votes for U, in the order the Python implementation processes them.
 fn block_scores(image: &RgbImage) -> Option<Vec<BlockVote>> {
     let (width, height) = image.dimensions();
     let crop_width = (width / 4 * 4) as usize;
@@ -242,7 +245,6 @@ fn block_scores(image: &RgbImage) -> Option<Vec<BlockVote>> {
         return None;
     }
     let mut u = vec![0f64; crop_width * crop_height];
-    let mut v = vec![0f64; crop_width * crop_height];
     for y in 0..crop_height {
         for x in 0..crop_width {
             let pixel = image.get_pixel(x as u32, y as u32);
@@ -250,15 +252,17 @@ fn block_scores(image: &RgbImage) -> Option<Vec<BlockVote>> {
             let g = f64::from(pixel[1]);
             let b = f64::from(pixel[2]);
             let index = y * crop_width + x;
-            u[index] = (-0.14713 * r - 0.28886 * g + 0.436 * b + 128.0).clamp(0.0, 255.0);
-            v[index] = (0.615 * r - 0.51499 * g - 0.10001 * b + 128.0).clamp(0.0, 255.0);
+            // OpenCV converts to uint8 YUV with rounding. Keeping the
+            // fractional value shifts many block coefficients across the
+            // quantization threshold, so round like the reference decoder.
+            u[index] = (-0.14713 * r - 0.28886 * g + 0.436 * b + 128.0)
+                .round()
+                .clamp(0.0, 255.0);
         }
     }
     let (u_ll, u_width, u_height) = haar_ll(&u, crop_width, crop_height)?;
-    let (v_ll, v_width, v_height) = haar_ll(&v, crop_width, crop_height)?;
     let mut scores = Vec::new();
     collect_block_scores(&u_ll, u_width, u_height, &mut scores);
-    collect_block_scores(&v_ll, v_width, v_height, &mut scores);
     Some(scores)
 }
 
@@ -438,13 +442,13 @@ mod tests {
         assert_eq!(locked, 1.0);
     }
 
-    /// Build an RGB image whose YUV U/V planes carry the payload. This is a
+    /// Build an RGB image whose YUV U plane carries the payload. This is a
     /// test-only encoder using flat 2×2 blocks, which preserves the LL plane.
     fn watermarked_image(payload: &str, size: u32) -> RgbImage {
         let ll_width = (size / 2) as usize;
         let ll_height = (size / 2) as usize;
         let bits = payload_bits(payload);
-        let mut ll = vec![256.0; ll_width * ll_height]; // constant U/V = 128
+        let mut ll = vec![256.0; ll_width * ll_height]; // constant U = 128
         let blocks_x = ll_width / BLOCK;
         let blocks_y = ll_height / BLOCK;
         for block_y in 0..blocks_y {

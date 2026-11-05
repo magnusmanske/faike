@@ -72,7 +72,10 @@ pub fn detect(input: &Input, config: &DetectConfig) -> Vec<Signal> {
         if config.png_text {
             signals.extend(timed!("png", png::detect(input)));
         }
-        if config.container {
+        // The raw-byte scan would mostly re-find strings the structured
+        // detectors above already parsed (C2PA JSON, XMP packets). Run it only
+        // when they found nothing, so one piece of evidence counts once.
+        if config.container && signals.is_empty() {
             signals.extend(timed!("container", container::detect(input)));
         }
         if config.watermark.enabled {
@@ -141,5 +144,32 @@ mod tests {
             metadata: &metadata,
         };
         assert!(detect(&input, &DetectConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn container_is_only_a_fallback() {
+        let mut bytes = png_with_text(
+            "parameters",
+            "a cat\nSteps: 20, Sampler: Euler a, CFG scale: 7, Seed: 1",
+        );
+        bytes.extend_from_slice(b"trainedAlgorithmicMedia");
+        let metadata = Metadata::default();
+        let input = Input {
+            bytes: &bytes,
+            mime: "image/png",
+            metadata: &metadata,
+        };
+        let signals = detect(&input, &DetectConfig::default());
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.source == Source::PngText)
+        );
+        assert!(
+            !signals
+                .iter()
+                .any(|signal| signal.source == Source::Container),
+            "raw strings already covered by PNG text must not count twice"
+        );
     }
 }
