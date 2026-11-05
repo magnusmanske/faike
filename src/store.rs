@@ -4,7 +4,7 @@
 //! small: one process writes, the same process serves. A future multi-process
 //! deployment can swap this for ToolsDB without touching the watcher.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use crate::model::Detection;
 
 pub struct Store {
     data: RwLock<StoreData>,
-    file: Mutex<tokio::fs::File>,
+    file: Option<Mutex<tokio::fs::File>>,
     add_lock: Mutex<()>,
     store_path: PathBuf,
     cursor_path: PathBuf,
@@ -73,7 +73,6 @@ impl Default for Filter {
 impl Store {
     pub async fn open(config: &crate::config::Config) -> Result<Self> {
         ensure_parent(&config.store_file).await?;
-        let max_seen = config.max_records.saturating_mul(20).max(10_000);
         let (records, compacted) = load_records(&config.store_file, config.max_records).await?;
         if let Some(lines) = compacted {
             write_lines(&config.store_file, &lines).await?;
@@ -84,9 +83,25 @@ impl Store {
             .open(&config.store_file)
             .await
             .with_context(|| format!("Cannot open {}", config.store_file.display()))?;
+        Ok(Self::build(config, Some(file), records))
+    }
+
+    /// Open an existing store without taking a writer handle or compacting it.
+    /// Used by the web service while the bot owns the file.
+    pub async fn open_read_only(config: &crate::config::Config) -> Result<Self> {
+        let (records, _) = load_records(&config.store_file, config.max_records).await?;
+        Ok(Self::build(config, None, records))
+    }
+
+    fn build(
+        config: &crate::config::Config,
+        file: Option<tokio::fs::File>,
+        records: VecDeque<Detection>,
+    ) -> Self {
+        let max_seen = config.max_records.saturating_mul(20).max(10_000);
         let store = Self {
             data: RwLock::new(StoreData::new()),
-            file: Mutex::new(file),
+            file: file.map(Mutex::new),
             add_lock: Mutex::new(()),
             store_path: config.store_file.clone(),
             cursor_path: config.cursor_file.clone(),
@@ -100,7 +115,25 @@ impl Store {
                 data.records.push_back(detection);
             }
         }
-        Ok(store)
+        store
+    }
+
+    /// Reload the JSONL from disk, replacing the in-memory view.
+    pub async fn reload(&self) -> Result<()> {
+        let (records, _) = load_records(&self.store_path, self.max_records).await?;
+        let mut data = self.write();
+        data.records = records;
+        data.seen.clear();
+        data.seen_order.clear();
+        let ids: Vec<String> = data
+            .records
+            .iter()
+            .map(|detection| detection.id.clone())
+            .collect();
+        for id in ids {
+            data.mark_seen(&id, self.max_seen);
+        }
+        Ok(())
     }
 
     pub fn is_seen(&self, id: &str) -> bool {
@@ -119,9 +152,12 @@ impl Store {
         if self.is_seen(&detection.id) {
             return Ok(false);
         }
+        let Some(file_lock) = &self.file else {
+            bail!("Detection store is read-only");
+        };
         let mut line = serde_json::to_vec(&detection).context("Serializing detection")?;
         line.push(b'\n');
-        let mut file = self.file.lock().await;
+        let mut file = file_lock.lock().await;
         file.write_all(&line)
             .await
             .with_context(|| format!("Writing {}", self.store_path.display()))?;
@@ -413,5 +449,24 @@ mod tests {
         assert_eq!(store.count(), 2);
         let contents = tokio::fs::read_to_string(&config.store_file).await.unwrap();
         assert_eq!(contents.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_only_store_reloads() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir);
+        let writer = Store::open(&config).await.unwrap();
+        writer.add(detection("a", 90)).await.unwrap();
+        drop(writer);
+
+        let reader = Store::open_read_only(&config).await.unwrap();
+        assert_eq!(reader.count(), 1);
+        assert!(reader.add(detection("b", 90)).await.is_err());
+
+        let writer = Store::open(&config).await.unwrap();
+        writer.add(detection("b", 90)).await.unwrap();
+        drop(writer);
+        reader.reload().await.unwrap();
+        assert_eq!(reader.count(), 2);
     }
 }

@@ -9,6 +9,7 @@ pub mod container;
 pub mod description;
 pub mod exif;
 pub mod png;
+pub mod watermark;
 pub mod xmp;
 
 use crate::config::DetectConfig;
@@ -73,6 +74,12 @@ pub fn detect(input: &Input, config: &DetectConfig) -> Vec<Signal> {
         }
         if config.container {
             signals.extend(timed!("container", container::detect(input)));
+        }
+        if config.watermark.enabled {
+            signals.extend(timed!(
+                "watermark",
+                watermark::detect(input, &config.watermark)
+            ));
         }
     }
     if config.metadata {

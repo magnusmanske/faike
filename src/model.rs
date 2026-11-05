@@ -89,6 +89,8 @@ pub enum Source {
     Wikitext,
     /// Upload comment/summary.
     Comment,
+    /// Pixel-level watermark.
+    Watermark,
 }
 
 impl Source {
@@ -102,6 +104,7 @@ impl Source {
             Self::Metadata => "description",
             Self::Wikitext => "wikitext",
             Self::Comment => "comment",
+            Self::Watermark => "watermark",
         }
     }
 }

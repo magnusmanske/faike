@@ -16,11 +16,12 @@ use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 
-const USAGE: &str = "Usage: aimer <run|watch|serve|scan> [config.json | file]\n\
-    run [config]    watch uploads and serve the web UI\n\
-    watch [config]  watch uploads only (bot process)\n\
-    serve [config]  serve the web UI from an existing detection store\n\
-    scan <files>    analyse local files and print JSON";
+const USAGE: &str = "Usage: aimer <run|watch|serve|scan|calibrate> [config.json | files]\n\
+    run [config]        watch uploads and serve the web UI\n\
+    watch [config]      watch uploads only (bot process)\n\
+    serve [config]      serve the web UI from an existing detection store\n\
+    scan <files>        analyse local files and print JSON\n\
+    calibrate <files>   print watermark detector metrics for local files";
 
 #[tokio::main]
 async fn main() {
@@ -45,7 +46,7 @@ async fn run() -> Result<()> {
             tokio::spawn(async move {
                 watcher::run(watcher_config, watcher_store, watcher_status).await;
             });
-            web::run(config, store, status).await
+            web::run(config, store, status, false).await
         }
         "watch" => {
             let config = Arc::new(load_config(&args)?);
@@ -60,12 +61,12 @@ async fn run() -> Result<()> {
         }
         "serve" => {
             let config = Arc::new(load_config(&args)?);
-            let store = Arc::new(store::Store::open(&config).await?);
+            let store = Arc::new(store::Store::open_read_only(&config).await?);
             let status = Arc::new(status::Status::new());
             if let Some(cursor) = store.load_cursor().await {
                 status.set_cursor(Some(&cursor));
             }
-            web::run(config, store, status).await
+            web::run(config, store, status, true).await
         }
         "scan" => {
             let files = &args[2..];
@@ -74,6 +75,16 @@ async fn run() -> Result<()> {
             }
             for file in files {
                 scan(file).await?;
+            }
+            Ok(())
+        }
+        "calibrate" => {
+            let files = &args[2..];
+            if files.is_empty() {
+                bail!(USAGE);
+            }
+            for file in files {
+                calibrate(file).await?;
             }
             Ok(())
         }
@@ -100,12 +111,13 @@ async fn scan(path: &str) -> Result<()> {
         std::fs::read(path_ref).with_context(|| format!("Cannot read {}", path_ref.display()))?;
     let mime = mime_for(path_ref, &bytes);
     let metadata = Metadata::default();
+    let config = optional_config();
     let input = Input {
         bytes: &bytes,
         mime: &mime,
         metadata: &metadata,
     };
-    let signals = detect::detect(&input, &config::DetectConfig::default());
+    let signals = detect::detect(&input, &config.detect);
     let score = model::score(&signals);
     let level = model::Level::from_score(score);
     let output = json!({
@@ -118,6 +130,47 @@ async fn scan(path: &str) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+async fn calibrate(path: &str) -> Result<()> {
+    let path_ref = Path::new(path);
+    let bytes =
+        std::fs::read(path_ref).with_context(|| format!("Cannot read {}", path_ref.display()))?;
+    let mime = mime_for(path_ref, &bytes);
+    let config = optional_config();
+    let Some(image) = detect::watermark::load_image(&bytes) else {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "file": path,
+                "mime": mime,
+                "skipped": "image could not be decoded or is too large"
+            }))?
+        );
+        return Ok(());
+    };
+    let dwt_dct = detect::watermark::dwt_dct::report(&image.to_rgb8());
+    let trustmark = detect::watermark::trustmark::report(image, &config.detect.watermark);
+    let output = json!({
+        "file": path,
+        "mime": mime,
+        "size": bytes.len(),
+        "dwt_dct": dwt_dct,
+        "trustmark": trustmark,
+        "thresholds": {
+            "dwt_match": config.detect.watermark.dwt_match_threshold,
+            "dwt_margin": config.detect.watermark.dwt_margin_threshold,
+            "dwt_generic_margin": config.detect.watermark.dwt_generic_margin_threshold,
+            "dwt_lock": config.detect.watermark.dwt_lock_threshold,
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn optional_config() -> Config {
+    let path = std::env::var("AIMER_CONFIG").unwrap_or_else(|_| "config.json".to_string());
+    Config::load(path).unwrap_or_default()
 }
 
 fn mime_for(path: &Path, bytes: &[u8]) -> String {

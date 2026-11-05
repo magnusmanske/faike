@@ -3,3 +3,6 @@
 /detections.jsonl
 /cursor.json
 /audits/
+/models/
+
+replica.my.cnf

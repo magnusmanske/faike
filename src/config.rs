@@ -85,6 +85,49 @@ pub struct DetectConfig {
     pub container: bool,
     /// Commons `extmetadata`, file-page wikitext and upload comment.
     pub metadata: bool,
+    /// Pixel-level watermark detection (expensive; independent of metadata).
+    pub watermark: WatermarkConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WatermarkConfig {
+    pub enabled: bool,
+    /// Stable Diffusion `invisible-watermark` DWT-DCT payloads.
+    pub dwt_dct: bool,
+    /// Adobe TrustMark neural watermark decoder.
+    pub trustmark: bool,
+    /// Directory containing `encoder_Q.onnx` and `decoder_Q.onnx`.
+    pub models_dir: PathBuf,
+    /// TrustMark model variant (`Q` or `P`).
+    pub trustmark_variant: String,
+    /// TrustMark error-correction schema (`Bch5`, `Bch4`, `Bch3`, `BchSuper`).
+    pub trustmark_version: String,
+    /// Minimum fraction of known DWT-DCT payload bits that must match.
+    pub dwt_match_threshold: f64,
+    /// Minimum bit-stability margin for a known DWT-DCT payload.
+    pub dwt_margin_threshold: f64,
+    /// Minimum bit-stability margin to report an unknown DWT-DCT-like mark.
+    pub dwt_generic_margin_threshold: f64,
+    /// Minimum fraction of coefficients near the encoder's quantization centers.
+    pub dwt_lock_threshold: f64,
+}
+
+impl Default for WatermarkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dwt_dct: true,
+            trustmark: true,
+            models_dir: PathBuf::from("models"),
+            trustmark_variant: "Q".to_string(),
+            trustmark_version: "Bch5".to_string(),
+            dwt_match_threshold: 0.85,
+            dwt_margin_threshold: 0.35,
+            dwt_generic_margin_threshold: 0.60,
+            dwt_lock_threshold: 0.60,
+        }
+    }
 }
 
 impl Default for DetectConfig {
@@ -96,6 +139,7 @@ impl Default for DetectConfig {
             png_text: true,
             container: true,
             metadata: true,
+            watermark: WatermarkConfig::default(),
         }
     }
 }
@@ -121,6 +165,17 @@ impl Config {
         self.max_records = self.max_records.max(1);
         self.max_wikitext_bytes = self.max_wikitext_bytes.clamp(1024, 4 * 1024 * 1024);
         self.request_timeout_sec = self.request_timeout_sec.clamp(5, 600);
+        self.detect.watermark.dwt_match_threshold =
+            self.detect.watermark.dwt_match_threshold.clamp(0.0, 1.0);
+        self.detect.watermark.dwt_margin_threshold =
+            self.detect.watermark.dwt_margin_threshold.clamp(0.0, 1.0);
+        self.detect.watermark.dwt_generic_margin_threshold = self
+            .detect
+            .watermark
+            .dwt_generic_margin_threshold
+            .clamp(0.0, 1.0);
+        self.detect.watermark.dwt_lock_threshold =
+            self.detect.watermark.dwt_lock_threshold.clamp(0.0, 1.0);
     }
 
     /// Checks needed before starting the watcher. The web server itself can run

@@ -13,15 +13,15 @@ and confidence, and the UI never presents a score as proof.
 ```bash
 cp config.json.template config.json
 # Edit user_agent and, for local use, leave web_address at 127.0.0.1.
+scripts/fetch-models.sh models   # optional but recommended; 62 MB of TrustMark models
 cargo run --release -- run config.json
 # Browse http://127.0.0.1:8000/
 ```
 
 `run` starts the watcher and the web server in one process. `watch` runs only the
-watcher (for a bot process), and `serve` serves the UI from an existing store.
-`serve` loads the store at startup and does not live-reload; use `run` for a
-live UI. The JSONL store is single-writer, so do not point a separate `watch`
-and `serve` at it concurrently.
+watcher (for a bot process), and `serve` serves the UI from an existing store and
+reloads it every five seconds. The JSONL store is single-writer: the bot owns the
+writer, the web service opens it read-only.
 
 Analyse a local file without the watcher:
 
@@ -41,6 +41,8 @@ aggregate score and level.
 | XMP / EXIF software fields | `xmp:CreatorTool`, `tiff:Software`, `Software`, `Make`, `Model`, `ImageDescription`, `UserComment` | Medium |
 | PNG text chunks | A1111 `parameters`, ComfyUI `prompt`/`workflow`, `Software`, `Comment`, `Raw profile type xmp` | High for prompt payloads, Medium for text |
 | Container fallback | AI source-type/AI-system strings in malformed or unusual containers; SVG metadata | High for explicit source types, lower for text |
+| Stable Diffusion DWT-DCT watermark | `StableDiffusionV1` (136 bits), `SDV1`/`SDXL` (32 bits), unknown-periodicity marks | High for a known payload, Medium for an unknown stable mark |
+| Adobe TrustMark | decoder payload with the configured BCH schema | Medium (provenance, not necessarily AI) |
 | Commons `extmetadata` | `Software`, `ImageDescription`, `Credit`, `Artist`, `Categories` | Medium to High for `Software` |
 | File-page wikitext | `{{PD-algorithm}}`, `{{AI-generated}}`, `{{Created with Midjourney}}`, AI categories | High |
 | Upload comment | vendor names, explicit "AI-generated" statements | Low |
@@ -51,9 +53,8 @@ Medium or above adds a 5-point corroboration bonus, capped at 99. The default
 
 Deliberately **not** implemented yet:
 
-- Invisible watermark decoding (Google SynthID image, Stable Diffusion
-  `invisible-watermark` DWT-DCT, Meta Stable Signature/VideoSeal, Adobe
-  TrustMark).
+- Google SynthID image detection (not open source), Meta Stable Signature /
+  VideoSeal, and other model-based watermark schemes.
 - Visible watermark/logo detection or OCR.
 - Neural-network "is this AI?" classifiers.
 - Video/audio frame analysis. Video/audio uploads still get metadata and
@@ -82,7 +83,7 @@ flowchart TD
   downloads, retries for 429/5xx/`maxlag`, invalid-JSON/rate-limit pages.
 - `src/watcher.rs` — poll loop, batching, dedupe, concurrent download/analysis.
 - `src/detect/` — independent detectors: `c2pa`, `xmp`, `exif`, `png`,
-  `container`, `description`.
+  `container`, `description`, and `watermark` (`dwt_dct`, `trustmark`).
 - `src/patterns.rs` — single source of truth for vendor names, prompt markers,
   AI phrases, wikitext templates, and the AbuseFilter regexes.
 - `src/store.rs` — append-only JSONL + in-memory ring; cursor in a small JSON
@@ -92,8 +93,9 @@ flowchart TD
 - `src/abuse_filter.rs` — generates paste-ready rules.
 
 The process runs the watcher and web server together. This keeps the MVP to one
-binary and one store. A future multi-process/Toolforge deployment can replace
-the store with ToolsDB; the watcher and detectors do not depend on the web layer.
+binary and one store. On Toolforge, `Procfile` runs them as separate processes:
+the bot owns the JSONL writer, and `serve` opens it read-only and reloads it. A
+future ToolsDB store removes the single-writer limitation.
 
 ## AbuseFilter output
 
@@ -137,6 +139,8 @@ Used:
 | `roxmltree` | MIT/Apache-2.0 | Read-only XMP XML parsing |
 | `miniz_oxide` | MIT/Apache-2.0 | `zTXt` inflation with an output cap |
 | `aho-corasick`, `regex` | MIT/Apache-2.0 | Vendor/prompt/wikitext matching |
+| `image` | MIT/Apache-2.0 | Pixel decoding for watermark analysis |
+| `trustmark` + `ort` | MIT / MIT OR Apache-2.0 | Adobe TrustMark ONNX decoder; ONNX Runtime is statically linked at build time |
 | `reqwest`, `axum`, `tokio` | MIT/Apache-2.0 | HTTP client, web server, runtime |
 
 Considered but not used:
@@ -146,9 +150,8 @@ Considered but not used:
 | `aicheck` | AGPL-3.0-or-later | Closest end-to-end prior art (C2PA, XMP/IPTC, EXIF, PNG text, heuristic watermarks). Its AGPL license and heavy dependency set (including the C2PA SDK, `image`, `rustfft`, i18n) made it unsuitable to link into this tool. The vendor/signal ideas informed this implementation. |
 | `exif-oxide` | AGPL-3.0-or-later | Ambitious ExifTool reimplementation; AGPL. `nom-exif` covers the fields we need. |
 | `encypher-c2pa` | Apache-2.0 | Verification-only offline C2PA SDK; a lighter alternative to `c2pa`, but less established. |
-| `provcheck` suite | Apache-2.0 | C2PA verification plus TrustMark/SilentCipher/SynthID-text watermark detectors. Some neural detectors are commercial/DLC; worth evaluating for the watermark roadmap. |
-| `trustmark` | MIT | Adobe TrustMark implementation; candidate for neural watermark detection, but requires model weights and a conversion/performance check. |
-| `invisible-watermark` | MIT | Implements a *different* LSB/DWT scheme. It is **not** the Stable Diffusion `invisible-watermark` Python library's `dwtDct` payload, so it cannot detect those marks. |
+| `provcheck` suite | Apache-2.0 | C2PA verification plus TrustMark/SilentCipher/SynthID-text watermark detectors. Some neural detectors are commercial/DLC; worth evaluating for additional watermark schemes. |
+| `invisible-watermark` (crates.io) | MIT | Implements a *different* LSB/DWT scheme. It is **not** the Stable Diffusion `invisible-watermark` Python library's `dwtDct` payload, so it cannot detect those marks. |
 | `img-parts` | MIT/Apache-2.0 | Container chunk/segment reader. Rejects bad CRCs, while this tool deliberately parses tolerantly; a good replacement if strict parsing is acceptable. |
 | `kamadak-exif` | BSD-2-Clause | Mature EXIF parser; `nom-exif` additionally gives PNG text and video containers. |
 | `gamut-metadata` | MIT/Apache-2.0 | Unified EXIF/XMP/IPTC facade; newer, and `nom-exif` + `roxmltree` was sufficient. |
@@ -159,14 +162,15 @@ Considered but not used:
 
 Other-language/ecosystem options worth translating or wrapping:
 
-- **Stable Diffusion `invisible-watermark`** (Python, ShieldMnt): `dwtDct` and
-  `rivaGan` payloads. The DWT-DCT path is a tractable Rust port (Haar DWT +
-  block DCT + payload decoding), but it is fragile under resizing/JPEG and needs
-  careful false-positive testing. `aicheck` contains a heuristic implementation
-  that is a useful reference.
+- **Stable Diffusion `invisible-watermark`** (Python, ShieldMnt, MIT): the
+  `dwtDct` decoder is implemented here from the published algorithm. It is
+  fragile: a PNG with a correctly embedded payload decodes cleanly, while a
+  JPEG-recompressed copy often does not (4:2:0 chroma subsampling and
+  quantization remove the weak U/V signal). The reference Python decoder fails
+  the same way, so this is a property of the scheme, not of the port. `rivaGan`
+  is not implemented.
 - **Meta Stable Signature / VideoSeal** (PyTorch): model-based watermark
-  detection; possible via `ort` (ONNX Runtime) or `candle`, after model
-  conversion.
+  detection; possible via `ort` / `candle`, after model conversion.
 - **Google SynthID**: the text watermark has public implementations
   (`provcheck-synthid-text`); the image detector is not open source and is
   available through Google's cloud tooling. Do not claim image SynthID support
@@ -177,6 +181,38 @@ Other-language/ecosystem options worth translating or wrapping:
   for blocking.
 - **OCR for visible watermarks** (Tesseract bindings, `ocrs`/`rten`): future,
   and best combined with vendor-logo templates rather than free-text OCR.
+
+## Watermark calibration
+
+Pixel watermarks always need calibration. `aimer calibrate <files...>` prints, for
+each image, the DWT-DCT candidates (length, bit-stability margin, fraction of
+coefficients near the encoder's quantization centers, and known-payload match)
+and the TrustMark decoder result. It uses `config.json` or `AIMER_CONFIG` for
+model paths and thresholds.
+
+Defaults were calibrated on a small local corpus (PNG and JPEG maps, photos,
+noise, gradients, a C2PA sample, and Python `invisible-watermark` encodes):
+
+- `dwt_match_threshold = 0.85`: genuine `StableDiffusionV1`/`SDV1` PNG encodes
+  matched 100% of payload bits; ordinary images matched ~0.5–0.63.
+- `dwt_margin_threshold = 0.35`: genuine PNG encodes were 0.38–0.46;
+  ordinary images were 0.03–0.20.
+- `dwt_generic_margin_threshold = 0.60`: unknown payloads must be very stable.
+- `dwt_lock_threshold = 0.60`: genuine encodes were ~0.65–0.66; ordinary
+  images were ~0.45–0.57. This guard is essential: a constant or JPEG-flattened
+  image produces unanimous zero bits (margin 1.0) without any watermark.
+
+Known limitations:
+
+- DWT-DCT survives PNG but often not JPEG re-encoding, resizing, or screenshot
+  round-trips. The reference Python decoder has the same limitation.
+- The current decoder accepts only the configured TrustMark BCH schema. The Rust
+  crate falls back to other schemas, which turns random payloads into BCH3
+  codewords; a 75-bit fallback while configured for BCH5 is ignored. This is
+  deliberate false-positive control, not a decoder failure.
+- A TrustMark mark is provenance evidence, not automatically AI evidence.
+- Images below 256×256 are skipped by DWT-DCT; images above 24 megapixels are
+  not decoded for pixel analysis.
 
 ## Configuration and operation
 
@@ -196,6 +232,12 @@ See `config.json.template`. Key points:
 - The watcher is polite: one recent-changes poll at a time, batched imageinfo
   and wikitext requests, two concurrent downloads by default, `maxlag=5`, and
   retries with `Retry-After` on 429/5xx.
+- Watermark analysis is controlled by `detect.watermark`. `models_dir` points at
+  the directory populated by `scripts/fetch-models.sh`; on Toolforge use a
+  persistent path such as `/data/project/aimer/models`. TrustMark is disabled
+  cleanly if the models are absent. The ONNX Runtime is statically linked, so
+  no separate shared library is needed at runtime, but builds are larger and
+  slower.
 
 Security/privacy: the tool only reads public data, never authenticates, and does
 not store IP addresses or e-mail addresses. The web UI escapes all dynamic
@@ -212,19 +254,58 @@ cargo fmt --check
 ```
 
 Tests cover the detector parsers with synthetic PNG/XMP/EXIF data, scoring,
-AbuseFilter escaping/chunking, the store/cursor, the recent-changes parser, and
-the web routes (including HTML escaping). `AIMER_DEBUG=1` prints per-detector
-timings and per-file progress.
+watermark DWT-DCT round-trips (including JPEG/constant-image false-positive
+guards), the optional TrustMark round-trip when models are present, AbuseFilter
+escaping/chunking, the store/cursor and read-only reload, the recent-changes
+parser, and the web routes (including HTML escaping). `AIMER_DEBUG=1` prints
+per-detector timings and per-file progress.
+
+## Toolforge deployment
+
+`Procfile` assumes the tool account is `aimer` and the config is at
+`/data/project/aimer/config.json`:
+
+```procfile
+web: AIMER_PORT=$PORT ./target/release/aimer serve /data/project/aimer/config.json
+bot: ./target/release/aimer watch /data/project/aimer/config.json
+```
+
+Prepare the persistent paths once on the tool account:
+
+```bash
+mkdir -p /data/project/aimer/models
+scripts/fetch-models.sh /data/project/aimer/models
+# In /data/project/aimer/config.json:
+#   "web_address": "0.0.0.0"
+#   "store_file": "/data/project/aimer/detections.jsonl"
+#   "cursor_file": "/data/project/aimer/cursor.json"
+#   "detect": {"watermark": {"models_dir": "/data/project/aimer/models"}}
+```
+
+Start/restart the web service with the build-service image, then run
+`./restart.sh` for the bot job. The web service opens the JSONL store read-only
+and reloads it every five seconds; the bot is the only writer. The models and
+ONNX Runtime are large, so the build and image are larger than a metadata-only
+deployment. Typical first launch:
+
+```bash
+toolforge webservice buildservice start --mount=all --health-check-path /healthz
+./restart.sh
+```
+
+If the build service cannot download the ONNX Runtime binaries used by
+`trustmark`, build with `--no-default-features`; the DWT-DCT detector then still
+works and TrustMark is skipped.
 
 ## Roadmap
 
-1. Watermark decoders: Stable Diffusion DWT-DCT, TrustMark/Stable Signature via
-   ONNX, with calibrated false-positive rates.
+1. Additional watermark decoders: Stable Signature/VideoSeal, SynthID where an
+   API/credential is available, and additional TrustMark schemas.
 2. Visible watermark/logo and OCR signals, plus a "vendor badge" detector.
 3. Optional neural classifiers, clearly labelled probabilistic and never used
    for `disallow`.
 4. Video/audio: sample frames/audio, reuse the image/watermark detectors.
-5. Toolforge deployment: ToolsDB storage, multiple watchers, a public report
-   page, and an on-wiki bot mode that tags/notifies.
+5. ToolsDB storage, multiple watchers, a public report page, and an on-wiki bot
+   mode that tags/notifies.
 6. C2PA trust-list validation and trust-state display (currently only
    cryptographic validity is reported; no trust anchors are configured).

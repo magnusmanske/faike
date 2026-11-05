@@ -15,6 +15,7 @@ use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 500;
@@ -56,13 +57,40 @@ struct DetectionList {
     detections: Vec<Detection>,
 }
 
-pub async fn run(config: Arc<Config>, store: Arc<Store>, status: Arc<Status>) -> Result<()> {
+pub async fn run(
+    config: Arc<Config>,
+    store: Arc<Store>,
+    status: Arc<Status>,
+    live_reload: bool,
+) -> Result<()> {
     status.set_stored(store.count());
     let state = AppState {
         config,
         store,
         status,
     };
+    if live_reload {
+        let store = state.store.clone();
+        let status = state.status.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                match store.reload().await {
+                    Ok(()) => {
+                        status.set_stored(store.count());
+                        if let Some(cursor) = store.load_cursor().await {
+                            status.set_cursor(Some(&cursor));
+                        }
+                        status.clear_error();
+                    }
+                    Err(error) => {
+                        status.set_error(format!("Store reload failed: {error:#}"));
+                        eprintln!("aimer: store reload failed: {error:#}");
+                    }
+                }
+            }
+        });
+    }
     let address = state.config.listen_addr();
     let listener = tokio::net::TcpListener::bind(&address).await?;
     eprintln!("aimer: listening on http://{address}");
