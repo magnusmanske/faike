@@ -6,7 +6,7 @@ set -euo pipefail
 toolforge jobs delete faike-bot 2>/dev/null || true
 rm -f /data/project/faike/faike-bot.out /data/project/faike/faike-bot.err
 
-toolforge jobs run --mem 1Gi --continuous --mount=all \
+toolforge jobs run --mem 2Gi --continuous --mount=all \
 	--image tool-faike/tool-faike:latest \
 	--command bot \
 	--filelog -o /data/project/faike/faike-bot.out -e /data/project/faike/faike-bot.err \

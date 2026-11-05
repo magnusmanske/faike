@@ -506,6 +506,13 @@ the ToolsDB replica and reloads every five seconds, so it does not compete with
 the bot for the primary. The models and ONNX Runtime are large, so the build and
 image are larger than a metadata-only deployment.
 
+The bot job needs **2 GiB**, not 1 GiB: pixel analysis keeps several
+full-resolution planes alive, and one 24 MP image peaks around 540 MB. With
+two concurrent downloads (the default), a 1 GiB limit is OOM-killed as soon as
+a batch contains two large photos, and the cursor makes it retry the same batch
+in a crash loop. `restart.sh` therefore requests `--mem 2Gi`; the tool quota
+allows up to 6 GiB per job.
+
 If the build service cannot download the ONNX Runtime binaries used by
 `trustmark` and the classifier, build with
 `--no-default-features --features toolsdb,telemetry`; the DWT-DCT detector then
