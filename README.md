@@ -460,7 +460,7 @@ cargo run --release -- corpus /tmp/neg/index.json
 
 ```procfile
 web: FAIKE_ADDRESS=0.0.0.0 FAIKE_PORT=$PORT ./target/release/faike serve /data/project/faike/config.json
-bot: RUST_LOG=warn ./target/release/faike watch /data/project/faike/config.json
+bot: RUST_LOG=warn,nom_exif=error ./target/release/faike watch /data/project/faike/config.json
 ```
 
 Prepare the persistent paths once on the tool account:
