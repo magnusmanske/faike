@@ -7,6 +7,7 @@ mod patterns;
 mod status;
 mod store;
 mod telemetry;
+mod user_pages;
 mod watcher;
 mod web;
 mod wiki;

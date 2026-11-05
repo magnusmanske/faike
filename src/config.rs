@@ -33,6 +33,9 @@ pub struct Config {
     pub web_port: u16,
     /// Browser auto-refresh interval; `0` disables it.
     pub refresh_sec: u64,
+    /// Look up whether uploader user and user-talk pages exist, so the web UI
+    /// can mark missing pages with a red link. Best-effort and cached.
+    pub check_user_pages: bool,
     /// HTTP timeout for API and file requests.
     pub request_timeout_sec: u64,
     /// Cap on fetched wikitext, to keep pathological pages out of memory.
@@ -57,6 +60,7 @@ impl Default for Config {
             web_address: "127.0.0.1".to_string(),
             web_port: 8000,
             refresh_sec: 60,
+            check_user_pages: true,
             request_timeout_sec: 60,
             max_wikitext_bytes: 64 * 1024,
             detect: DetectConfig::default(),

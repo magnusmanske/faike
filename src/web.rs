@@ -6,6 +6,7 @@ use crate::model::Detection;
 use crate::status::Status;
 use crate::store::{Filter, Store};
 use crate::telemetry;
+use crate::user_pages::{Exists, UserPages, safe_domain};
 use crate::wiki::{DEFAULT_DOMAIN, Wiki};
 use anyhow::Result;
 use axum::Router;
@@ -15,6 +16,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +32,7 @@ struct AppState {
     config: Arc<Config>,
     store: Arc<Store>,
     status: Arc<Status>,
+    user_pages: Arc<UserPages>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -89,6 +92,7 @@ pub async fn run(
 ) -> Result<()> {
     status.set_stored(store.count());
     let state = AppState {
+        user_pages: Arc::new(UserPages::new(&config)),
         config,
         store,
         status,
@@ -145,6 +149,7 @@ async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> R
     let filter = params.filter(&wikis);
     let mut detections = state.store.recent(&filter);
     detections.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.score.cmp(&a.score)));
+    let user_pages = state.user_pages.resolve(&detections, &wikis).await;
     let status = state.status.snapshot();
     let refresh = state.config.refresh_sec > 0
         && params.q.is_none()
@@ -269,7 +274,7 @@ async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> R
             </tr></thead><tbody>",
         );
         for detection in &detections {
-            html.push_str(&row(detection));
+            html.push_str(&row(detection, &user_pages));
         }
         html.push_str("</tbody></table></div>");
     }
@@ -277,7 +282,7 @@ async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> R
     html_response(html)
 }
 
-fn row(detection: &Detection) -> String {
+fn row(detection: &Detection, user_pages: &HashMap<(String, String), Exists>) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
@@ -330,7 +335,12 @@ fn row(detection: &Detection) -> String {
     let _ = write!(
         out,
         "</td><td>{}</td><td class=\"time\">{}</td><td class=\"signals\">",
-        escape_html(&detection.user),
+        user_links(
+            detection,
+            user_pages
+                .get(&(detection.wiki.clone(), detection.user.trim().to_string()))
+                .copied()
+        ),
         escape_html(&detection.timestamp)
     );
     for signal in &detection.signals {
@@ -351,6 +361,37 @@ fn row(detection: &Detection) -> String {
     }
     out.push_str("</td></tr>");
     out
+}
+
+/// A MediaWiki-style uploader link: `User:Foo (talk)`. A missing page gets the
+/// `redlink` class, matching the wiki's own link colour. If existence is
+/// unknown (lookup disabled or failed) the link stays neutral.
+fn user_links(detection: &Detection, exists: Option<Exists>) -> String {
+    let user = detection.user.trim();
+    if user.is_empty() {
+        return String::new();
+    }
+    if !safe_domain(&detection.wiki) {
+        return escape_html(user);
+    }
+    let base = format!("https://{}/wiki/", detection.wiki);
+    let encoded = query_encode(user);
+    let exists = exists.unwrap_or_default();
+    let user_class = if exists.user == Some(false) {
+        " class=\"redlink\""
+    } else {
+        ""
+    };
+    let talk_class = if exists.talk == Some(false) {
+        " class=\"redlink\""
+    } else {
+        ""
+    };
+    format!(
+        "<a{user_class} href=\"{base}User:{encoded}\" target=\"_blank\" rel=\"noreferrer noopener\">{name}</a> \
+         (<a{talk_class} href=\"{base}User_talk:{encoded}\" target=\"_blank\" rel=\"noreferrer noopener\">talk</a>)",
+        name = escape_html(user)
+    )
 }
 
 async fn api_detections(State(state): State<AppState>, Query(params): Query<Params>) -> Response {
@@ -552,6 +593,7 @@ body { margin:0 auto; padding:1.25rem; max-width:1400px; background:var(--bg); c
 header h1 { margin:0; font-size:1.6rem; letter-spacing:-.02em; }
 header p { margin:.2rem 0 1rem; color:var(--muted); }
 a { color:var(--accent); }
+.redlink { color:var(--high); }
 .status { display:flex; flex-wrap:wrap; gap:.5rem 1.2rem; padding:.6rem .8rem; border:1px solid var(--line); border-radius:.4rem; color:var(--muted); font-size:.88rem; }
 .status code { color:var(--fg); }
 .wikis { display:flex; flex-wrap:wrap; gap:.4rem; margin:.8rem 0 0; }
@@ -656,6 +698,7 @@ mod tests {
             config,
             store,
             status: Arc::new(Status::new()),
+            user_pages: Arc::new(UserPages::disabled()),
         }
     }
 
@@ -681,6 +724,26 @@ mod tests {
         let html = body(response).await;
         assert!(html.contains("File:&lt;script&gt;alert(1)&lt;/script&gt;.png"));
         assert!(!html.contains("<script>alert(1)</script>"));
+    }
+
+    #[tokio::test]
+    async fn index_links_uploaders_to_their_wiki() {
+        let dir = TempDir::new().unwrap();
+        let app = router(state(&dir).await);
+        let html = body(
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(html.contains("https://commons.wikimedia.org/wiki/User:Example"));
+        assert!(html.contains("https://commons.wikimedia.org/wiki/User_talk:Example"));
+        assert!(html.contains(">talk</a>"));
     }
 
     #[tokio::test]
@@ -809,5 +872,58 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body(response).await, "ok\n");
+    }
+
+    fn sample_detection(wiki: &str, user: &str) -> Detection {
+        Detection::new(
+            "id".into(),
+            wiki.into(),
+            "File:X.png".into(),
+            "2026-01-01T00:00:00Z".into(),
+            user.into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "image/png".into(),
+            0,
+            "id".into(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn user_links_target_the_wiki_and_mark_missing_pages() {
+        let sample = sample_detection("commons.wikimedia.org", "Example User");
+        let html = user_links(
+            &sample,
+            Some(Exists {
+                user: Some(false),
+                talk: Some(true),
+            }),
+        );
+        assert!(html.contains("href=\"https://commons.wikimedia.org/wiki/User:Example%20User\""));
+        assert!(
+            html.contains("href=\"https://commons.wikimedia.org/wiki/User_talk:Example%20User\"")
+        );
+        assert!(html.contains(">Example User</a>"));
+        assert!(html.contains(">talk</a>"));
+        assert_eq!(
+            html.matches("redlink").count(),
+            1,
+            "only the user page is missing"
+        );
+    }
+
+    #[test]
+    fn user_links_escape_names_and_reject_bad_domains() {
+        let sample = sample_detection("commons.wikimedia.org", "<b>Mallory</b>");
+        let html = user_links(&sample, None);
+        assert!(html.contains("&lt;b&gt;Mallory&lt;/b&gt;"));
+        assert!(!html.contains("<b>"));
+
+        let sample = sample_detection("evil.example/\"", "Mallory");
+        let html = user_links(&sample, None);
+        assert!(!html.contains("href=\""));
+        assert_eq!(html, "Mallory");
     }
 }

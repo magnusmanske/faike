@@ -139,6 +139,12 @@ wiki, `/?wiki=all` shows every wiki, and each row links to its wiki. The same
 `wiki` parameter filters `/api/detections` and `/abuse-filters`; `/api/wikis`
 lists the configured wikis.
 
+Uploader names link to `User:` and `User talk:` on the wiki where the file was
+uploaded, in the wiki's own `name (talk)` style. The web service asks each
+wiki's Action API once per user (batched, cached for an hour, 3 s timeout) and
+marks missing pages with a red link. Set `check_user_pages` to `false` to skip
+those lookups; links then stay neutral.
+
 ## AbuseFilter output
 
 `GET /abuse-filters` returns plain text; `GET /abuse-filters.json` returns the
