@@ -1,7 +1,7 @@
 {
   "//": "Copy to config.json and edit. JSON has no comments; keys starting with // are ignored.",
   "//user_agent": "Required by Wikimedia policy: include a contactable URL or e-mail.",
-  "user_agent": "aimer/0.1 (https://example.org/aimer; you@example.org)",
+  "user_agent": "faike/0.1 (https://faike.toolforge.org; you@example.org)",
 
   "api_url": "https://commons.wikimedia.org/w/api.php",
   "rc_namespace": 6,
@@ -20,9 +20,20 @@
   "abuse_filter_min_score": 80,
   "max_records": 2000,
 
-  "//store_file": "Use a persistent path on Toolforge, e.g. /data/project/aimer/detections.jsonl",
-  "store_file": "detections.jsonl",
-  "cursor_file": "cursor.json",
+  "//store": "kind 'file' is a local JSONL file with one writer; 'toolsdb' is the shared Toolforge database.",
+  "store": {
+    "kind": "toolsdb",
+    "//file": "Used by the 'file' backend. Must be on persistent storage on Toolforge.",
+    "file": "detections.jsonl",
+    "cursor_file": "cursor.json",
+    "//database": "Empty derives <tool user>__faike_p. ToolsDB names start with the tool user.",
+    "database": "s58339__faike_p",
+    "//replica_my_cnf": "On Toolforge leave null: toolforge finds $TOOL_DATA_DIR/replica.my.cnf. For local tests point at a copy with local='true' and run toolforge-tunnel.",
+    "replica_my_cnf": null,
+    "pool_max": 3,
+    "connect_timeout_sec": 10,
+    "max_statement_time_sec": 30
+  },
 
   "//web_address": "Use 0.0.0.0 on Toolforge, or set AIMER_ADDRESS.",
   "web_address": "127.0.0.1",
@@ -46,7 +57,7 @@
       "trustmark_version": "Bch5",
       "dwt_match_threshold": 0.85,
       "dwt_margin_threshold": 0.35,
-      "dwt_generic_margin_threshold": 0.60,
+      "dwt_generic_margin_threshold": 0.80,
       "dwt_lock_threshold": 0.60
     }
   }

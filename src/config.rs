@@ -29,10 +29,7 @@ pub struct Config {
     pub min_score: u8,
     /// Minimum score included in the exact-SHA1 AbuseFilter list.
     pub abuse_filter_min_score: u8,
-    /// Append-only JSONL detection store.
-    pub store_file: PathBuf,
-    /// Recent-changes cursor, persisted across restarts.
-    pub cursor_file: PathBuf,
+    pub store: StoreConfig,
     /// Detections kept in memory for the web UI.
     pub max_records: usize,
     /// Web listen address. Use `0.0.0.0` on Toolforge; keep loopback locally.
@@ -61,8 +58,7 @@ impl Default for Config {
             download_mime_prefixes: vec!["image/".to_string()],
             min_score: 30,
             abuse_filter_min_score: 80,
-            store_file: PathBuf::from("detections.jsonl"),
-            cursor_file: PathBuf::from("cursor.json"),
+            store: StoreConfig::default(),
             max_records: 2000,
             web_address: "127.0.0.1".to_string(),
             web_port: 8000,
@@ -70,6 +66,52 @@ impl Default for Config {
             request_timeout_sec: 60,
             max_wikitext_bytes: 64 * 1024,
             detect: DetectConfig::default(),
+        }
+    }
+}
+
+/// Where detections are persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreKind {
+    /// Append-only JSONL, plus a JSON cursor file. One writer.
+    #[default]
+    File,
+    /// The tool's ToolsDB database. Shared by the bot and the web service.
+    Toolsdb,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StoreConfig {
+    pub kind: StoreKind,
+    /// JSONL store for the `file` backend.
+    pub file: PathBuf,
+    /// Recent-changes cursor for the `file` backend.
+    pub cursor_file: PathBuf,
+    /// ToolsDB database. Empty derives `<tool user>__faike_p`.
+    pub database: String,
+    /// Credentials file; `None` lets the `toolforge` crate search the usual
+    /// locations (`TOOL_*` variables, `$TOOL_DATA_DIR`, `$HOME`).
+    pub replica_my_cnf: Option<PathBuf>,
+    /// Connections held per ToolsDB server.
+    pub pool_max: usize,
+    pub connect_timeout_sec: u64,
+    /// Server-side query limit; `0` uses the server default.
+    pub max_statement_time_sec: u64,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            kind: StoreKind::File,
+            file: PathBuf::from("detections.jsonl"),
+            cursor_file: PathBuf::from("cursor.json"),
+            database: String::new(),
+            replica_my_cnf: None,
+            pool_max: 3,
+            connect_timeout_sec: 10,
+            max_statement_time_sec: 30,
         }
     }
 }
@@ -124,7 +166,7 @@ impl Default for WatermarkConfig {
             trustmark_version: "Bch5".to_string(),
             dwt_match_threshold: 0.85,
             dwt_margin_threshold: 0.35,
-            dwt_generic_margin_threshold: 0.60,
+            dwt_generic_margin_threshold: 0.80,
             dwt_lock_threshold: 0.60,
         }
     }
@@ -163,6 +205,9 @@ impl Config {
         self.min_score = self.min_score.min(100);
         self.abuse_filter_min_score = self.abuse_filter_min_score.min(100);
         self.max_records = self.max_records.max(1);
+        self.store.pool_max = self.store.pool_max.clamp(1, 10);
+        self.store.connect_timeout_sec = self.store.connect_timeout_sec.clamp(1, 120);
+        self.store.max_statement_time_sec = self.store.max_statement_time_sec.min(600);
         self.max_wikitext_bytes = self.max_wikitext_bytes.clamp(1024, 4 * 1024 * 1024);
         self.request_timeout_sec = self.request_timeout_sec.clamp(5, 600);
         self.detect.watermark.dwt_match_threshold =
@@ -249,6 +294,22 @@ mod tests {
         assert_eq!(config.max_batch, 500);
         assert_eq!(config.download_concurrency, 1);
         assert_eq!(config.min_score, 100);
+    }
+
+    #[test]
+    fn store_section_defaults_and_clamps() {
+        let config: Config = serde_json::from_str(r#"{"store":{"kind":"toolsdb"}}"#).unwrap();
+        assert_eq!(config.store.kind, StoreKind::Toolsdb);
+        assert_eq!(config.store.pool_max, 3);
+
+        let mut config: Config = serde_json::from_str(
+            r#"{"store":{"pool_max":0,"connect_timeout_sec":0,"max_statement_time_sec":9999}}"#,
+        )
+        .unwrap();
+        config.clamp();
+        assert_eq!(config.store.pool_max, 1);
+        assert_eq!(config.store.connect_timeout_sec, 1);
+        assert_eq!(config.store.max_statement_time_sec, 600);
     }
 
     #[test]

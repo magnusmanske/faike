@@ -1,147 +1,76 @@
-//! Append-only detection store.
+//! Append-only JSONL on disk, with the cursor in a small JSON file.
 //!
-//! JSONL on disk plus an in-memory ring for the web UI. This is deliberately
-//! small: one process writes, the same process serves. A future multi-process
-//! deployment can swap this for ToolsDB without touching the watcher.
+//! One process writes; the same process, or another with `open_read_only`,
+//! reads. A future multi-process deployment should use the ToolsDB backend.
 
 use anyhow::{Context, Result, bail};
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+use super::Cache;
+use crate::config::Config;
 use crate::mediawiki::Cursor;
 use crate::model::Detection;
 
-pub struct Store {
-    data: RwLock<StoreData>,
+pub struct FileStore {
+    cache: Cache,
     file: Option<Mutex<tokio::fs::File>>,
     add_lock: Mutex<()>,
     store_path: PathBuf,
     cursor_path: PathBuf,
-    max_records: usize,
-    max_seen: usize,
 }
 
-struct StoreData {
-    records: VecDeque<Detection>,
-    seen_order: VecDeque<String>,
-    seen: HashSet<String>,
-}
-
-impl StoreData {
-    fn new() -> Self {
-        Self {
-            records: VecDeque::new(),
-            seen_order: VecDeque::new(),
-            seen: HashSet::new(),
-        }
-    }
-
-    fn mark_seen(&mut self, id: &str, max_seen: usize) {
-        if id.is_empty() || !self.seen.insert(id.to_string()) {
-            return;
-        }
-        self.seen_order.push_back(id.to_string());
-        while self.seen_order.len() > max_seen {
-            if let Some(old) = self.seen_order.pop_front() {
-                self.seen.remove(&old);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Filter {
-    pub min_score: u8,
-    pub text: Option<String>,
-    pub limit: usize,
-}
-
-impl Default for Filter {
-    fn default() -> Self {
-        Self {
-            min_score: 0,
-            text: None,
-            limit: 200,
-        }
-    }
-}
-
-impl Store {
-    pub async fn open(config: &crate::config::Config) -> Result<Self> {
-        ensure_parent(&config.store_file).await?;
-        let (records, compacted) = load_records(&config.store_file, config.max_records).await?;
+impl FileStore {
+    pub async fn open(config: &Config) -> Result<Self> {
+        let store_path = &config.store.file;
+        ensure_parent(store_path).await?;
+        let (records, compacted) = load_records(store_path, config.max_records).await?;
         if let Some(lines) = compacted {
-            write_lines(&config.store_file, &lines).await?;
+            write_lines(store_path, &lines).await?;
         }
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&config.store_file)
+            .open(store_path)
             .await
-            .with_context(|| format!("Cannot open {}", config.store_file.display()))?;
+            .with_context(|| format!("Cannot open {}", store_path.display()))?;
         Ok(Self::build(config, Some(file), records))
     }
 
     /// Open an existing store without taking a writer handle or compacting it.
-    /// Used by the web service while the bot owns the file.
-    pub async fn open_read_only(config: &crate::config::Config) -> Result<Self> {
-        let (records, _) = load_records(&config.store_file, config.max_records).await?;
+    pub async fn open_read_only(config: &Config) -> Result<Self> {
+        let (records, _) = load_records(&config.store.file, config.max_records).await?;
         Ok(Self::build(config, None, records))
     }
 
-    fn build(
-        config: &crate::config::Config,
-        file: Option<tokio::fs::File>,
-        records: VecDeque<Detection>,
-    ) -> Self {
-        let max_seen = config.max_records.saturating_mul(20).max(10_000);
-        let store = Self {
-            data: RwLock::new(StoreData::new()),
+    fn build(config: &Config, file: Option<tokio::fs::File>, records: VecDeque<Detection>) -> Self {
+        let cache = Cache::new(config.max_records);
+        cache.replace(records);
+        Self {
+            cache,
             file: file.map(Mutex::new),
             add_lock: Mutex::new(()),
-            store_path: config.store_file.clone(),
-            cursor_path: config.cursor_file.clone(),
-            max_records: config.max_records,
-            max_seen,
-        };
-        {
-            let mut data = store.write();
-            for detection in records {
-                data.mark_seen(&detection.id, store.max_seen);
-                data.records.push_back(detection);
-            }
+            store_path: config.store.file.clone(),
+            cursor_path: config.store.cursor_file.clone(),
         }
-        store
     }
 
     /// Reload the JSONL from disk, replacing the in-memory view.
     pub async fn reload(&self) -> Result<()> {
-        let (records, _) = load_records(&self.store_path, self.max_records).await?;
-        let mut data = self.write();
-        data.records = records;
-        data.seen.clear();
-        data.seen_order.clear();
-        let ids: Vec<String> = data
-            .records
-            .iter()
-            .map(|detection| detection.id.clone())
-            .collect();
-        for id in ids {
-            data.mark_seen(&id, self.max_seen);
-        }
+        let (records, _) = load_records(&self.store_path, self.cache.max_records()).await?;
+        self.cache.replace(records);
         Ok(())
     }
 
     pub fn is_seen(&self, id: &str) -> bool {
-        self.read().seen.contains(id)
+        self.cache.is_seen(id)
     }
 
     pub fn mark_seen(&self, id: &str) {
-        self.write().mark_seen(id, self.max_seen);
+        self.cache.mark_seen(id);
     }
 
     /// Store a detection. Returns `false` if the id was already seen.
@@ -149,7 +78,7 @@ impl Store {
         // Serialise check-and-insert: two concurrent downloads of the same
         // bytes must not write two records.
         let _guard = self.add_lock.lock().await;
-        if self.is_seen(&detection.id) {
+        if self.cache.is_seen(&detection.id) {
             return Ok(false);
         }
         let Some(file_lock) = &self.file else {
@@ -163,32 +92,16 @@ impl Store {
             .with_context(|| format!("Writing {}", self.store_path.display()))?;
         file.flush().await?;
         drop(file);
-        let mut data = self.write();
-        data.mark_seen(&detection.id, self.max_seen);
-        data.records.push_front(detection);
-        while data.records.len() > self.max_records {
-            data.records.pop_back();
-        }
+        self.cache.push(detection);
         Ok(true)
     }
 
-    pub fn recent(&self, filter: &Filter) -> Vec<Detection> {
-        let text = filter.text.as_ref().map(|text| text.to_lowercase());
-        let data = self.read();
-        data.records
-            .iter()
-            .filter(|detection| detection.score >= filter.min_score)
-            .filter(|detection| match &text {
-                Some(text) => matches(detection, text),
-                None => true,
-            })
-            .take(filter.limit)
-            .cloned()
-            .collect()
+    pub fn recent(&self, filter: &super::Filter) -> Vec<Detection> {
+        self.cache.recent(filter)
     }
 
     pub fn count(&self) -> usize {
-        self.read().records.len()
+        self.cache.count()
     }
 
     pub async fn load_cursor(&self) -> Option<Cursor> {
@@ -208,33 +121,6 @@ impl Store {
             .with_context(|| format!("Replacing {}", self.cursor_path.display()))?;
         Ok(())
     }
-
-    fn read(&self) -> RwLockReadGuard<'_, StoreData> {
-        self.data
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn write(&self) -> RwLockWriteGuard<'_, StoreData> {
-        self.data
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-fn matches(detection: &Detection, needle: &str) -> bool {
-    detection.title.to_lowercase().contains(needle)
-        || detection.user.to_lowercase().contains(needle)
-        || detection.comment.to_lowercase().contains(needle)
-        || detection.mime.to_lowercase().contains(needle)
-        || detection.signals.iter().any(|signal| {
-            signal.code.to_lowercase().contains(needle)
-                || signal.detail.to_lowercase().contains(needle)
-                || signal
-                    .tool
-                    .as_ref()
-                    .is_some_and(|tool| tool.to_lowercase().contains(needle))
-        })
 }
 
 /// Read the last `max_records` JSONL lines. Returns them newest-first and,
@@ -269,7 +155,7 @@ async fn load_records(
         }
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut records = VecDeque::new();
     let mut valid = Vec::new();
     for line in &kept {
@@ -315,38 +201,20 @@ async fn ensure_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A simple builder for tests.
-#[cfg(test)]
-fn detection(id: &str, score: u8) -> Detection {
-    use crate::model::{Confidence, Level, Signal, Source};
-
-    Detection {
-        id: id.to_string(),
-        title: format!("File:{id}.png"),
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        user: "Example".into(),
-        comment: String::new(),
-        url: String::new(),
-        description_url: String::new(),
-        mime: "image/png".into(),
-        size: 1,
-        sha1: id.to_string(),
-        score,
-        level: Level::from_score(score),
-        signals: vec![Signal::new(Source::C2pa, Confidence::High, "test", "test")],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, StoreConfig};
+    use crate::store::{Filter, detection};
     use tempfile::TempDir;
 
     fn config(dir: &TempDir) -> Config {
         Config {
-            store_file: dir.path().join("detections.jsonl"),
-            cursor_file: dir.path().join("cursor.json"),
+            store: StoreConfig {
+                file: dir.path().join("detections.jsonl"),
+                cursor_file: dir.path().join("cursor.json"),
+                ..StoreConfig::default()
+            },
             max_records: 10,
             ..Config::default()
         }
@@ -356,14 +224,14 @@ mod tests {
     async fn detects_are_persisted_and_loaded() {
         let dir = TempDir::new().unwrap();
         let config = config(&dir);
-        let store = Store::open(&config).await.unwrap();
+        let store = FileStore::open(&config).await.unwrap();
         assert!(store.add(detection("a", 90)).await.unwrap());
         assert!(!store.add(detection("a", 90)).await.unwrap());
         assert!(store.add(detection("b", 40)).await.unwrap());
         assert_eq!(store.count(), 2);
         drop(store);
 
-        let store = Store::open(&config).await.unwrap();
+        let store = FileStore::open(&config).await.unwrap();
         assert_eq!(store.count(), 2);
         assert!(store.is_seen("a"));
         let recent = store.recent(&Filter::default());
@@ -373,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn filter_matches_text_and_score() {
         let dir = TempDir::new().unwrap();
-        let store = Store::open(&config(&dir)).await.unwrap();
+        let store = FileStore::open(&config(&dir)).await.unwrap();
         store.add(detection("a", 90)).await.unwrap();
         store.add(detection("b", 20)).await.unwrap();
         let filter = Filter {
@@ -391,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_round_trips() {
         let dir = TempDir::new().unwrap();
-        let store = Store::open(&config(&dir)).await.unwrap();
+        let store = FileStore::open(&config(&dir)).await.unwrap();
         let cursor = Cursor {
             timestamp: "2026-01-01T00:00:00Z".into(),
             rc_id: 42,
@@ -407,7 +275,7 @@ mod tests {
             max_records: 2,
             ..config(&dir)
         };
-        let store = Store::open(&config).await.unwrap();
+        let store = FileStore::open(&config).await.unwrap();
         for id in ["a", "b", "c"] {
             store.add(detection(id, 90)).await.unwrap();
         }
@@ -422,10 +290,10 @@ mod tests {
     async fn malformed_lines_are_skipped() {
         let dir = TempDir::new().unwrap();
         let config = config(&dir);
-        tokio::fs::write(&config.store_file, "not json\n")
+        tokio::fs::write(&config.store.file, "not json\n")
             .await
             .unwrap();
-        let store = Store::open(&config).await.unwrap();
+        let store = FileStore::open(&config).await.unwrap();
         assert_eq!(store.count(), 0);
     }
 
@@ -436,7 +304,7 @@ mod tests {
             max_records: 2,
             ..config(&dir)
         };
-        let store = Store::open(&config).await.unwrap();
+        let store = FileStore::open(&config).await.unwrap();
         for index in 0..10 {
             store
                 .add(detection(&format!("id{index}"), 90))
@@ -445,9 +313,9 @@ mod tests {
         }
         drop(store);
 
-        let store = Store::open(&config).await.unwrap();
+        let store = FileStore::open(&config).await.unwrap();
         assert_eq!(store.count(), 2);
-        let contents = tokio::fs::read_to_string(&config.store_file).await.unwrap();
+        let contents = tokio::fs::read_to_string(&config.store.file).await.unwrap();
         assert_eq!(contents.lines().count(), 2);
     }
 
@@ -455,15 +323,15 @@ mod tests {
     async fn read_only_store_reloads() {
         let dir = TempDir::new().unwrap();
         let config = config(&dir);
-        let writer = Store::open(&config).await.unwrap();
+        let writer = FileStore::open(&config).await.unwrap();
         writer.add(detection("a", 90)).await.unwrap();
         drop(writer);
 
-        let reader = Store::open_read_only(&config).await.unwrap();
+        let reader = FileStore::open_read_only(&config).await.unwrap();
         assert_eq!(reader.count(), 1);
         assert!(reader.add(detection("b", 90)).await.is_err());
 
-        let writer = Store::open(&config).await.unwrap();
+        let writer = FileStore::open(&config).await.unwrap();
         writer.add(detection("b", 90)).await.unwrap();
         drop(writer);
         reader.reload().await.unwrap();

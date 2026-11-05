@@ -24,11 +24,14 @@ roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "sync", "net"] }
+# ToolsDB pools, credentials and the matching mysql_async version.
+toolforge = { version = "6.2", default-features = false, features = ["wikipool"], optional = true }
 trustmark = { version = "0.4", optional = true }
 
 [features]
-default = ["trustmark"]
+default = ["trustmark", "toolsdb"]
 trustmark = ["dep:trustmark"]
+toolsdb = ["dep:toolforge"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,11 +3,11 @@
 # The web service is restarted separately with `toolforge webservice buildservice restart`.
 set -euo pipefail
 
-toolforge jobs delete aimer-bot 2>/dev/null || true
-rm -f /data/project/aimer/aimer-bot.out /data/project/aimer/aimer-bot.err
+toolforge jobs delete faike-bot 2>/dev/null || true
+rm -f /data/project/faike/faike-bot.out /data/project/faike/faike-bot.err
 
 toolforge jobs run --mem 1Gi --continuous --mount=all \
-	--image tool-aimer/tool-aimer:latest \
+	--image tool-faike/tool-faike:latest \
 	--command bot \
-	--filelog -o /data/project/aimer/aimer-bot.out -e /data/project/aimer/aimer-bot.err \
-	aimer-bot
+	--filelog -o /data/project/faike/faike-bot.out -e /data/project/faike/faike-bot.err \
+	faike-bot

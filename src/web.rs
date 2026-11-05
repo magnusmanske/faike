@@ -469,8 +469,11 @@ mod tests {
 
     fn config(dir: &TempDir) -> Config {
         Config {
-            store_file: dir.path().join("detections.jsonl"),
-            cursor_file: dir.path().join("cursor.json"),
+            store: crate::config::StoreConfig {
+                file: dir.path().join("detections.jsonl"),
+                cursor_file: dir.path().join("cursor.json"),
+                ..crate::config::StoreConfig::default()
+            },
             ..Config::default()
         }
     }
