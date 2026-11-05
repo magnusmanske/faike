@@ -34,7 +34,8 @@ cargo run --release -- scan path/to/file.png
 ```
 
 The `scan` output is JSON with one `Signal` per piece of evidence, plus an
-aggregate score and level.
+aggregate score and level. `corpus` evaluates a whole index; see the benchmark
+section below.
 
 ## What it detects
 
@@ -47,6 +48,8 @@ aggregate score and level.
 | Container fallback | AI source-type/AI-system strings in malformed or unusual containers; SVG metadata | High for explicit source types, lower for text |
 | Stable Diffusion DWT-DCT watermark | `StableDiffusionV1` (136 bits), `SDV1`/`SDXL` (32 bits), unknown-periodicity marks | High for a known payload, Medium for an unknown stable mark |
 | Adobe TrustMark | decoder payload with the configured BCH schema | Medium (provenance, not necessarily AI) |
+| ONNX AI-image classifier | optional Swin classifier for stripped files; catches many photorealistic Midjourney/Flux/Imagen/SD exports | Medium at ≥95%; probabilistic, weak on charts/diagrams |
+| Generator-size heuristic | exact common output sizes (1024×1024, 1536×768, …) with no camera/software metadata or PNG text | Low |
 | Wikimedia `extmetadata` | `Software`, `ImageDescription`, `Credit`, `Artist`, `Categories` | Medium to High for `Software` |
 | File-page wikitext | `{{PD-algorithm}}`, `{{AI-generated}}`, `{{Created with Midjourney}}`, AI categories | High |
 | Upload comment | vendor names, explicit "AI-generated" statements | Low |
@@ -60,7 +63,8 @@ Deliberately **not** implemented yet:
 - Google SynthID image detection (not open source), Meta Stable Signature /
   VideoSeal, and other model-based watermark schemes.
 - Visible watermark/logo detection or OCR.
-- Neural-network "is this AI?" classifiers.
+- AI-generated charts/diagrams: the pixel classifier sees these as human-made
+  (their layout/text dominates), and stripped charts have no provenance.
 - Video/audio frame analysis. Video/audio uploads still get metadata and
   description analysis; only `image/*` is downloaded by default.
 
@@ -91,7 +95,8 @@ flowchart TD
 - `src/watcher.rs` — polls every enabled wiki, batching, dedupe, concurrent
   download/analysis.
 - `src/detect/` — independent detectors: `c2pa`, `xmp`, `exif`, `png`,
-  `container`, `description`, and `watermark` (`dwt_dct`, `trustmark`).
+  `container`, `fingerprint`, `classifier`, `description`, and `watermark`
+  (`dwt_dct`, `trustmark`).
 - `src/patterns.rs` — single source of truth for vendor names, prompt markers,
   AI phrases, wikitext templates, and the AbuseFilter regexes.
 - `src/store/` — `Store` dispatches between the JSONL backend (`file.rs`) and
@@ -262,20 +267,24 @@ and the TrustMark decoder result. It uses `config.json` or `FAIKE_CONFIG` for
 model paths and thresholds.
 
 Defaults were calibrated on a small local corpus (PNG and JPEG maps, photos,
-noise, gradients, a C2PA sample, and Python `invisible-watermark` encodes) and
-on 75 files from the Commons `AI-generated_media` subcategories:
+noise, gradients, a C2PA sample, and Python `invisible-watermark` encodes), on
+76 files from the Commons `AI-generated_media` subcategories, and on 68 ordinary
+images as a negative control:
 
 - `dwt_match_threshold = 0.85`: genuine `StableDiffusionV1`/`SDV1` PNG encodes
   matched 97–100% of payload bits; ordinary images matched ~0.5–0.63.
 - `dwt_margin_threshold = 0.35`: genuine PNG encodes were 0.46–0.93; ordinary
   images were 0.03–0.45.
-- `dwt_generic_margin_threshold = 0.80`: an unknown-periodicity mark is weak
-  evidence, and flat graphics (charts, logos) can produce a stable-looking
-  signal. At 0.80, none of the 75 Commons files passes together with the lock
-  threshold.
+- `dwt_generic_margin_threshold = 0.90`: an unknown-periodicity mark is weak
+  evidence, and periodic screenshots/photos can look stable. Two negatives had
+  margins of 0.82 and 0.87; 0.90 removes them, and no known-positive relies on
+  the generic signal.
 - `dwt_lock_threshold = 0.60`: genuine encodes were 0.66–0.84; ordinary images
   were ~0.45. This guard is essential: a constant or JPEG-flattened image
   produces unanimous zero bits (margin 1.0) without any watermark.
+- `classifier.threshold = 0.95`: all 35 classifier hits on the positive corpus
+  were at least 97%, while the weakest negative hit was 83%. Lowering the
+  threshold adds false positives without gaining corpus recall.
 
 The reference `invisible-watermark` encoder only marks the U channel (its
 `scales` list suggests U and V, but the loop covers channels 0–1), and OpenCV
@@ -314,6 +323,20 @@ See `config.json.template`. Key points:
   `toolforge` crate finds the credentials itself; locally point it at a copy with
   `local = 'true'` and run `toolforge-tunnel`. `pool_max`, `connect_timeout_sec`
   and `max_statement_time_sec` follow the Toolforge connection policy.
+- Watermark analysis is controlled by `detect.watermark`. `models_dir` points at
+  the directory populated by `scripts/fetch-models.sh`; on Toolforge use a
+  persistent path such as `/data/project/faike/models`. TrustMark is disabled
+  cleanly if the models are absent. The ONNX Runtime is statically linked, so
+  no separate shared library is needed at runtime, but builds are larger and
+  slower.
+- `detect.classifier` is the optional AI-image classifier. Run
+  `scripts/fetch-classifier.sh models` once (about 93 MB); if the model is
+  missing, the detector is skipped. `threshold` defaults to 0.95, `ai_label`
+  selects the "artificial" output index (0 for the bundled Swin model). The
+  classifier runs only when the structured detectors found nothing, and skips
+  camera photos and images with an extreme aspect ratio.
+- `detect.fingerprint` is the low-confidence exact-size heuristic. It is on by
+  default; set it to `false` to suppress its 30-point signals.
 - `DASHBOARD_TOKEN` enables `wikimisc` telemetry (component `bot` or `web`);
   without it the service runs normally. Metrics include polls, uploads,
   analysed files, detections per wiki, store errors, and analysis duration.
@@ -322,12 +345,6 @@ See `config.json.template`. Key points:
 - The watcher is polite: one recent-changes poll at a time, batched imageinfo
   and wikitext requests, two concurrent downloads by default, `maxlag=5`, and
   retries with `Retry-After` on 429/5xx.
-- Watermark analysis is controlled by `detect.watermark`. `models_dir` points at
-  the directory populated by `scripts/fetch-models.sh`; on Toolforge use a
-  persistent path such as `/data/project/faike/models`. TrustMark is disabled
-  cleanly if the models are absent. The ONNX Runtime is statically linked, so
-  no separate shared library is needed at runtime, but builds are larger and
-  slower.
 
 Security/privacy: the tool only reads public data, never authenticates, and does
 not store IP addresses or e-mail addresses. The web UI escapes all dynamic
@@ -345,10 +362,11 @@ cargo fmt --check
 
 Tests cover the detector parsers with synthetic PNG/XMP/EXIF data, scoring,
 watermark DWT-DCT round-trips (including JPEG/constant-image false-positive
-guards), the optional TrustMark round-trip when models are present, AbuseFilter
-escaping/chunking, both store backends and read-only reload, the recent-changes
-parser, and the web routes (including HTML escaping). `FAIKE_DEBUG=1` prints
-per-detector timings and per-file progress.
+guards), the optional TrustMark and classifier round-trips when models are
+present, the generator-size heuristic, AbuseFilter escaping/chunking, both store
+backends and read-only reload, the recent-changes parser, and the web routes
+(including HTML escaping). `FAIKE_DEBUG=1` prints per-detector timings and
+per-file progress.
 
 `tests/corpus.rs` runs the built binary over seven permanent fixtures in
 `tests/fixtures/`: five unmodified Commons AI-media uploads (C2PA, XMP and EXIF
@@ -356,27 +374,51 @@ signals), one ordinary photo as a negative control, and one synthetic
 `invisible-watermark` PNG. Attribution and licences are in
 `tests/fixtures/README.md`.
 
-A 2026-11 snapshot of 75 files from the `AI-generated_media` subcategories
-(originals, not thumbnails) flagged 25 of 75:
+### Evaluating detection rates
 
-| Category | Flagged | Main signal |
+`faike corpus <index.json> [--bytes-only]` evaluates an index of
+`{title: {path, extmetadata, wikitext?, comment?}}`. `--bytes-only` drops the
+MediaWiki metadata, which simulates an upload whose page does not declare AI;
+without it, the full watcher path is measured. Output is JSONL per file, with a
+summary on stderr.
+
+On the 2026-11 Commons snapshot (76 files, all declared AI):
+
+| Run | Flagged | Notes |
 | --- | --- | --- |
-| Adobe Firefly | 7/7 | C2PA |
-| DALL-E | 3/5 | C2PA |
-| ChatGPT | 1/5 | C2PA |
-| Prompts / Gemini | 8/23 | XMP, C2PA, PNG text |
-| Stable Diffusion | 5/16 | A1111 PNG parameters |
-| Midjourney, Flux, Imagen, Meta AI | 1/19 | XMP (one Meta AI file) |
+| Full metadata | 76/76 | the description detector catches categories/templates |
+| Bytes only, before the classifier | 25/76 | C2PA/XMP/PNG text/EXIF only |
+| Bytes only, now | 62/76 (82%) | adds 35 classifier and 1 generator-size signal |
 
-The unflagged files are mostly re-encoded or stripped of metadata, which is the
-reported weakness of C2PA/XMP in practice. No Commons file in the sample carried
-a DWT-DCT mark; the reference Python decoder returns zeros for them too, so the
-true-positive watermark path is covered by the synthetic fixture instead.
+The 14 byte-only misses are almost all LLM-generated charts and diagrams: the
+classifier confidently considers them human-made, and no watermark survives.
+That is a known limitation, not a tuning problem.
+
+Negative control: 68 ordinary images from the Featured pictures, Quality images,
+Diagrams, Screenshots and Photographs categories. Five were flagged: three had
+C2PA/XMP saying they are AI-generated or AI-upscaled (label noise in the negative
+set), and two were classifier signals, one of them from the same AI-upscaled
+portrait series. The approximate false-positive rate is 1.5–3%. The fingerprint
+heuristic, the camera-EXIF/aspect gate, and the DWT generic threshold were tuned
+on this set.
 
 The ToolsDB round-trip is opt-in because it needs the tunnel and credentials:
 
 ```bash
 FAIKE_TOOLSDB_TEST=1 cargo test -- --ignored
+```
+
+To reproduce the benchmark locally (the downloads stay out of the repository):
+
+```bash
+scripts/fetch-corpus.py --out /tmp/ai --per-category 20
+scripts/fetch-corpus.py --out /tmp/neg --per-category 15 \
+    --category "Featured pictures on Wikimedia Commons" \
+    --category "Quality images" --category "Diagrams" \
+    --category "Screenshots" --category "Photographs"
+scripts/fetch-classifier.sh models          # optional, ~93 MB
+cargo run --release -- corpus /tmp/ai/index.json --bytes-only
+cargo run --release -- corpus /tmp/neg/index.json
 ```
 
 ## Toolforge deployment
@@ -394,10 +436,14 @@ Prepare the persistent paths once on the tool account:
 ```bash
 mkdir -p /data/project/faike/models
 scripts/fetch-models.sh /data/project/faike/models
+scripts/fetch-classifier.sh /data/project/faike/models
 # In /data/project/faike/config.json:
 #   "web_address": "0.0.0.0"
 #   "store": {"kind": "toolsdb", "database": "s58339__faike_p"}
-#   "detect": {"watermark": {"models_dir": "/data/project/faike/models"}}
+#   "detect": {
+#     "watermark": {"models_dir": "/data/project/faike/models"},
+#     "classifier": {"model_path": "/data/project/faike/models/ai-image-detector.onnx"}
+#   }
 ```
 
 The database (`s58339__faike_p`) and its tables are created on first start by
@@ -421,8 +467,9 @@ the bot for the primary. The models and ONNX Runtime are large, so the build and
 image are larger than a metadata-only deployment.
 
 If the build service cannot download the ONNX Runtime binaries used by
-`trustmark`, build with `--no-default-features`; the DWT-DCT detector then still
-works and TrustMark is skipped.
+`trustmark` and the classifier, build with
+`--no-default-features --features toolsdb,telemetry`; the DWT-DCT detector then
+still works and both ONNX detectors are skipped.
 
 ## Roadmap
 
