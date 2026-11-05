@@ -1,0 +1,212 @@
+//! Configuration.
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// MediaWiki Action API endpoint. Defaults to Wikimedia Commons.
+    pub api_url: String,
+    /// Contactable User-Agent, required for the watcher (Wikimedia policy).
+    pub user_agent: String,
+    /// Seconds between recent-changes polls.
+    pub poll_interval_sec: u64,
+    /// Uploads to analyse on the first run. `0` starts at the current time.
+    pub backfill_events: usize,
+    /// Recent-changes rows per request (API maximum for normal users is 500).
+    pub max_batch: usize,
+    /// Namespace to watch for uploads. Wikimedia Commons uses 6 (File).
+    pub rc_namespace: i32,
+    /// Skip files larger than this.
+    pub max_download_bytes: u64,
+    /// Concurrent file downloads.
+    pub download_concurrency: usize,
+    /// Only download these MIME prefixes. Metadata is still analysed for all.
+    pub download_mime_prefixes: Vec<String>,
+    /// Minimum score stored and shown.
+    pub min_score: u8,
+    /// Minimum score included in the exact-SHA1 AbuseFilter list.
+    pub abuse_filter_min_score: u8,
+    /// Append-only JSONL detection store.
+    pub store_file: PathBuf,
+    /// Recent-changes cursor, persisted across restarts.
+    pub cursor_file: PathBuf,
+    /// Detections kept in memory for the web UI.
+    pub max_records: usize,
+    /// Web listen address. Use `0.0.0.0` on Toolforge; keep loopback locally.
+    pub web_address: String,
+    pub web_port: u16,
+    /// Browser auto-refresh interval; `0` disables it.
+    pub refresh_sec: u64,
+    /// HTTP timeout for API and file requests.
+    pub request_timeout_sec: u64,
+    /// Cap on fetched wikitext, to keep pathological pages out of memory.
+    pub max_wikitext_bytes: usize,
+    pub detect: DetectConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            api_url: "https://commons.wikimedia.org/w/api.php".to_string(),
+            user_agent: String::new(),
+            poll_interval_sec: 15,
+            backfill_events: 50,
+            max_batch: 500,
+            rc_namespace: 6,
+            max_download_bytes: 64 * 1024 * 1024,
+            download_concurrency: 2,
+            download_mime_prefixes: vec!["image/".to_string()],
+            min_score: 30,
+            abuse_filter_min_score: 80,
+            store_file: PathBuf::from("detections.jsonl"),
+            cursor_file: PathBuf::from("cursor.json"),
+            max_records: 2000,
+            web_address: "127.0.0.1".to_string(),
+            web_port: 8000,
+            refresh_sec: 60,
+            request_timeout_sec: 60,
+            max_wikitext_bytes: 64 * 1024,
+            detect: DetectConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DetectConfig {
+    pub c2pa: bool,
+    pub exif: bool,
+    pub xmp: bool,
+    pub png_text: bool,
+    /// Raw-bytes fallback for malformed or unusual containers.
+    pub container: bool,
+    /// Commons `extmetadata`, file-page wikitext and upload comment.
+    pub metadata: bool,
+}
+
+impl Default for DetectConfig {
+    fn default() -> Self {
+        Self {
+            c2pa: true,
+            exif: true,
+            xmp: true,
+            png_text: true,
+            container: true,
+            metadata: true,
+        }
+    }
+}
+
+impl Config {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Cannot read {}", path.display()))?;
+        let mut config: Self = serde_json::from_str(&raw)
+            .with_context(|| format!("Invalid JSON in {}", path.display()))?;
+        config.clamp();
+        Ok(config)
+    }
+
+    /// Clamp values that would otherwise waste API quota or break the UI.
+    fn clamp(&mut self) {
+        self.poll_interval_sec = self.poll_interval_sec.max(1);
+        self.max_batch = self.max_batch.clamp(1, 500);
+        self.download_concurrency = self.download_concurrency.clamp(1, 8);
+        self.min_score = self.min_score.min(100);
+        self.abuse_filter_min_score = self.abuse_filter_min_score.min(100);
+        self.max_records = self.max_records.max(1);
+        self.max_wikitext_bytes = self.max_wikitext_bytes.clamp(1024, 4 * 1024 * 1024);
+        self.request_timeout_sec = self.request_timeout_sec.clamp(5, 600);
+    }
+
+    /// Checks needed before starting the watcher. The web server itself can run
+    /// without a User-Agent.
+    pub fn validate_for_run(&self) -> Result<()> {
+        if self.user_agent.trim().is_empty() {
+            bail!(
+                "Set `user_agent` in the config to a URL or e-mail address that identifies you; \
+                 Wikimedia requires a contactable User-Agent"
+            );
+        }
+        if !self.api_url.starts_with("http://") && !self.api_url.starts_with("https://") {
+            bail!("`api_url` must be an http(s) URL");
+        }
+        if self.download_mime_prefixes.is_empty() {
+            bail!(
+                "`download_mime_prefixes` must not be empty; use [\"image/\"] to analyse images only"
+            );
+        }
+        Ok(())
+    }
+
+    /// True if a file of this MIME type should be downloaded for byte-level
+    /// analysis.
+    pub fn should_download(&self, mime: &str, size: u64) -> bool {
+        size > 0
+            && size <= self.max_download_bytes
+            && self
+                .download_mime_prefixes
+                .iter()
+                .any(|prefix| mime.starts_with(prefix.as_str()))
+    }
+
+    pub fn listen_addr(&self) -> String {
+        let address = std::env::var("AIMER_ADDRESS").unwrap_or_else(|_| self.web_address.clone());
+        let port = std::env::var("AIMER_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(self.web_port);
+        format!("{address}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_sane() {
+        let config = Config::default();
+        assert_eq!(config.api_url, "https://commons.wikimedia.org/w/api.php");
+        assert_eq!(config.max_batch, 500);
+        assert!(config.detect.c2pa);
+    }
+
+    #[test]
+    fn partial_config_uses_defaults() {
+        let config: Config = serde_json::from_str(r#"{"poll_interval_sec": 5}"#).unwrap();
+        assert_eq!(config.poll_interval_sec, 5);
+        assert_eq!(config.max_batch, 500);
+        assert!(config.detect.exif);
+    }
+
+    #[test]
+    fn values_are_clamped() {
+        let mut config: Config = serde_json::from_str(
+            r#"{"max_batch": 9999, "download_concurrency": 0, "min_score": 200}"#,
+        )
+        .unwrap();
+        config.clamp();
+        assert_eq!(config.max_batch, 500);
+        assert_eq!(config.download_concurrency, 1);
+        assert_eq!(config.min_score, 100);
+    }
+
+    #[test]
+    fn run_requires_a_user_agent() {
+        let config = Config::default();
+        assert!(config.validate_for_run().is_err());
+    }
+
+    #[test]
+    fn download_policy_respects_mime_and_size() {
+        let config = Config::default();
+        assert!(config.should_download("image/jpeg", 1024));
+        assert!(!config.should_download("video/webm", 1024));
+        assert!(!config.should_download("image/jpeg", config.max_download_bytes + 1));
+    }
+}

@@ -1,0 +1,40 @@
+{
+  "//": "Copy to config.json and edit. JSON has no comments; keys starting with // are ignored.",
+  "//user_agent": "Required by Wikimedia policy: include a contactable URL or e-mail.",
+  "user_agent": "aimer/0.1 (https://example.org/aimer; you@example.org)",
+
+  "api_url": "https://commons.wikimedia.org/w/api.php",
+  "rc_namespace": 6,
+
+  "poll_interval_sec": 15,
+  "backfill_events": 50,
+  "max_batch": 500,
+  "request_timeout_sec": 60,
+  "max_wikitext_bytes": 65536,
+
+  "max_download_bytes": 67108864,
+  "download_concurrency": 2,
+  "download_mime_prefixes": ["image/"],
+
+  "min_score": 30,
+  "abuse_filter_min_score": 80,
+  "max_records": 2000,
+
+  "//store_file": "Use a persistent path on Toolforge, e.g. /data/project/aimer/detections.jsonl",
+  "store_file": "detections.jsonl",
+  "cursor_file": "cursor.json",
+
+  "//web_address": "Use 0.0.0.0 on Toolforge, or set AIMER_ADDRESS.",
+  "web_address": "127.0.0.1",
+  "web_port": 8000,
+  "refresh_sec": 60,
+
+  "detect": {
+    "c2pa": true,
+    "exif": true,
+    "xmp": true,
+    "png_text": true,
+    "container": true,
+    "metadata": true
+  }
+}
