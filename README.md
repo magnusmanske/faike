@@ -283,6 +283,23 @@ signals), one ordinary photo as a negative control, and one synthetic
 `invisible-watermark` PNG. Attribution and licences are in
 `tests/fixtures/README.md`.
 
+A 2026-11 snapshot of 75 files from the `AI-generated_media` subcategories
+(originals, not thumbnails) flagged 25 of 75:
+
+| Category | Flagged | Main signal |
+| --- | --- | --- |
+| Adobe Firefly | 7/7 | C2PA |
+| DALL-E | 3/5 | C2PA |
+| ChatGPT | 1/5 | C2PA |
+| Prompts / Gemini | 8/23 | XMP, C2PA, PNG text |
+| Stable Diffusion | 5/16 | A1111 PNG parameters |
+| Midjourney, Flux, Imagen, Meta AI | 1/19 | XMP (one Meta AI file) |
+
+The unflagged files are mostly re-encoded or stripped of metadata, which is the
+reported weakness of C2PA/XMP in practice. No Commons file in the sample carried
+a DWT-DCT mark; the reference Python decoder returns zeros for them too, so the
+true-positive watermark path is covered by the synthetic fixture instead.
+
 The ToolsDB round-trip is opt-in because it needs the tunnel and credentials:
 
 ```bash
