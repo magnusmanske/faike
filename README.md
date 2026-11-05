@@ -1,9 +1,11 @@
-# aimer
+# fAIke
 
-A watchdog for files uploaded to MediaWiki sites, starting with Wikimedia
-Commons. It inspects upload metadata and provenance signals for evidence that a
-file was created or edited with generative AI, stores detections, serves a small
-browsing UI, and emits rules that can be pasted into MediaWiki `AbuseFilter`.
+A watchdog for files uploaded to MediaWiki sites. It watches Wikimedia
+Commons, English Wikipedia and German Wikipedia by default, and can watch any
+further wiki added to its `wikis` table. It inspects upload metadata and
+provenance signals for evidence that a file was created or edited with
+generative AI, stores detections, serves a small browsing UI, and emits rules
+that can be pasted into MediaWiki `AbuseFilter`.
 
 The design is deliberately evidence-based: every detection carries its source
 and confidence, and the UI never presents a score as proof.
@@ -22,7 +24,8 @@ cargo run --release -- run config.json
 watcher (for a bot process), and `serve` serves the UI from an existing store and
 reloads it every five seconds. Detections go to the configured `store`: a local
 JSONL file (single writer) or the tool's ToolsDB database (shared by the bot and
-the web service).
+the web service). The wiki list lives in the same store and can be changed
+without a restart.
 
 Analyse a local file without the watcher:
 
@@ -44,7 +47,7 @@ aggregate score and level.
 | Container fallback | AI source-type/AI-system strings in malformed or unusual containers; SVG metadata | High for explicit source types, lower for text |
 | Stable Diffusion DWT-DCT watermark | `StableDiffusionV1` (136 bits), `SDV1`/`SDXL` (32 bits), unknown-periodicity marks | High for a known payload, Medium for an unknown stable mark |
 | Adobe TrustMark | decoder payload with the configured BCH schema | Medium (provenance, not necessarily AI) |
-| Commons `extmetadata` | `Software`, `ImageDescription`, `Credit`, `Artist`, `Categories` | Medium to High for `Software` |
+| Wikimedia `extmetadata` | `Software`, `ImageDescription`, `Credit`, `Artist`, `Categories` | Medium to High for `Software` |
 | File-page wikitext | `{{PD-algorithm}}`, `{{AI-generated}}`, `{{Created with Midjourney}}`, AI categories | High |
 | Upload comment | vendor names, explicit "AI-generated" statements | Low |
 
@@ -67,36 +70,69 @@ These are roadmap items, not silent gaps. See the crate survey below.
 
 ```mermaid
 flowchart TD
-    A[MediaWiki recentchanges<br/>logtype=upload, ns=6] --> B[imageinfo + extmetadata]
+    W[(wikis table)] --> A[MediaWiki recentchanges<br/>logtype=upload, ns=6]
+    A --> B[imageinfo + extmetadata]
     B --> C[file-page wikitext]
     B --> D{size/MIME allowed?}
     D -- yes --> E[bounded download]
     D -- no --> F[metadata-only analysis]
     E --> G[detectors]
     F --> G
-    G --> H[score + dedupe by SHA-1]
+    G --> H[score + dedupe by wiki and SHA-1]
     H --> I[(detection store<br/>JSONL or ToolsDB)]
     I --> J[axum UI / JSON API]
     I --> K[AbuseFilter export]
+    W --> J
 ```
 
 - `src/mediawiki.rs` — Action API client, cursor, `imageinfo`, wikitext, bounded
   downloads, retries for 429/5xx/`maxlag`, invalid-JSON/rate-limit pages.
-- `src/watcher.rs` — poll loop, batching, dedupe, concurrent download/analysis.
+- `src/wiki.rs` — the `Wiki` model and the Commons/enwiki/dewiki defaults.
+- `src/watcher.rs` — polls every enabled wiki, batching, dedupe, concurrent
+  download/analysis.
 - `src/detect/` — independent detectors: `c2pa`, `xmp`, `exif`, `png`,
   `container`, `description`, and `watermark` (`dwt_dct`, `trustmark`).
 - `src/patterns.rs` — single source of truth for vendor names, prompt markers,
   AI phrases, wikitext templates, and the AbuseFilter regexes.
 - `src/store/` — `Store` dispatches between the JSONL backend (`file.rs`) and
   the ToolsDB backend (`toolsdb.rs`); both share the in-memory ring in `mod.rs`.
+- `src/telemetry.rs` — `wikimisc` metrics for the bot and the web service.
 - `src/web.rs` — server-rendered UI, `/api/detections`, `/api/status`,
-  `/abuse-filters`, `/abuse-filters.json`, `/healthz`.
+  `/api/wikis`, `/abuse-filters`, `/abuse-filters.json`, `/healthz`.
 - `src/abuse_filter.rs` — generates paste-ready rules.
 
 The process runs the watcher and web server together. On Toolforge, `Procfile`
 runs them as separate processes. With ToolsDB both read the same database: the
 bot writes to the primary, `serve` reads the replica and reloads every five
 seconds. SQLite-style single-writer caveats do not apply.
+
+## Wikis
+
+The `wikis` table is the live list. The bot reads it every poll, the web service
+every five seconds, so changes need no restart:
+
+```sql
+-- add a wiki (the API endpoint must be https)
+INSERT INTO wikis (domain, display_name, api_url, sort_order)
+VALUES ('fr.wikipedia.org', 'French Wikipedia',
+        'https://fr.wikipedia.org/w/api.php', 3);
+
+-- stop polling it but keep its detections and cursor
+UPDATE wikis SET enabled = 0 WHERE domain = 'de.wikipedia.org';
+
+-- disable and remove it
+DELETE FROM wikis WHERE domain = 'de.wikipedia.org';
+```
+
+`namespace` defaults to 6 (File). The cursor columns are maintained by the bot.
+On first start the table is seeded with Commons, English Wikipedia and German
+Wikipedia; a `meta` flag prevents them from reappearing after a deliberate
+delete. The file backend keeps the same list, with the cursors, in `wikis.json`.
+
+The web UI defaults to Commons. `/?wiki=en.wikipedia.org` is a linkable view per
+wiki, `/?wiki=all` shows every wiki, and each row links to its wiki. The same
+`wiki` parameter filters `/api/detections` and `/abuse-filters`; `/api/wikis`
+lists the configured wikis.
 
 ## AbuseFilter output
 
@@ -129,6 +165,40 @@ Important limitations, by design:
 property (see Wikimedia T200942); the upload log's `img_sha1` is base-36 and is
 not used for the rules.
 
+### How AbuseFilter can access these results
+
+AbuseFilter is evaluated inside MediaWiki and cannot make HTTP calls, read the
+ToolsDB database, or consume a JSON feed. What it can see for an upload is the
+description/summary (`added_lines`, `summary`) and the file variables
+(`file_sha1`, `file_mime`, `file_size`, ...). So there is no way to give it a
+live lookup; the result has to be copied into the filter itself, or into
+wikitext that the filter matches. In practice:
+
+1. **Static export (available now).** Open
+   `/abuse-filters?wiki=commons.wikimedia.org`, review the rules, and paste them
+   into `Special:AbuseFilter`. Repeat when the list should be refreshed. This is
+   the simplest and fully supported path.
+2. **A bot-maintained SHA-1 filter.** A bot with the `abusefilter-modify` right
+   can periodically replace the `equals_to_any(file_sha1, ...)` part of one
+   filter with a fresh, short list from `/abuse-filters.json`. The filter still
+   evaluates locally; only the expression is updated. Keep the list small and
+   rotate it, because filter expressions have size limits.
+3. **Tag or template, then match that.** The bot can add a change tag to the
+   upload, or edit the file page to add a maintenance template/category. Later
+   edits can be matched with `added_lines`/`new_wikitext`, and queries/reports
+   can use the tag or category. This is asynchronous and does not stop the
+   original upload, but it is the only way to attach a per-file verdict without
+   hard-coding the bytes.
+4. **A list page for humans and other bots.** Publish the detections (or the
+   SHA-1 list) on an on-wiki page. AbuseFilter still cannot read it, but
+   reviewers, patrolling tools, and other bots can.
+
+A real live lookup would need a new AbuseFilter variable or parser function
+provided by a MediaWiki extension, which Wikimedia wikis do not have. The
+`warn`/`tag` actions are deliberate: metadata and watermarks are evidence, not
+proof, and blocking on them would create false positives that are hard to
+appeal.
+
 ## Rust crate survey
 
 Used:
@@ -158,7 +228,7 @@ Considered but not used:
 | `gamut-metadata` | MIT/Apache-2.0 | Unified EXIF/XMP/IPTC facade; newer, and `nom-exif` + `roxmltree` was sufficient. |
 | `little_exif` | MIT | Read/write EXIF; writing is not needed. |
 | `mediawiki` | MIT/Apache-2.0 | Action API builders; this tool needs `loginfo`, `extmetadata`, a custom cursor, and retry behaviour, so it uses a small direct client inspired by `wdrc_rs`. |
-| `wikimisc` | (git, project license) | Useful Toolforge/server helpers; not required for the standalone MVP. |
+| `wikimisc` | (git, project license) | Telemetry/metrics for the bot and web service. |
 | `toolforge` | MIT/Apache-2.0 | ToolsDB pools, credential lookup and `toolforge-tunnel`; used by the ToolsDB store. |
 
 Other-language/ecosystem options worth translating or wrapping:
@@ -185,10 +255,10 @@ Other-language/ecosystem options worth translating or wrapping:
 
 ## Watermark calibration
 
-Pixel watermarks always need calibration. `aimer calibrate <files...>` prints, for
+Pixel watermarks always need calibration. `faike calibrate <files...>` prints, for
 each image, the DWT-DCT candidates (length, bit-stability margin, fraction of
 coefficients near the encoder's quantization centers, and known-payload match)
-and the TrustMark decoder result. It uses `config.json` or `AIMER_CONFIG` for
+and the TrustMark decoder result. It uses `config.json` or `FAIKE_CONFIG` for
 model paths and thresholds.
 
 Defaults were calibrated on a small local corpus (PNG and JPEG maps, photos,
@@ -231,21 +301,24 @@ See `config.json.template`. Key points:
 
 - `user_agent` is mandatory and must identify you with a URL or e-mail.
   Wikimedia's User-Agent policy applies.
-- `backfill_events` analyses that many recent uploads on first start (default
-  50). `0` starts at the current time.
+- `backfill_events` analyses that many recent uploads on first start **per
+  wiki** (default 50). `0` starts at the current time.
 - `download_mime_prefixes` defaults to `["image/"]`; files outside it still get
   metadata/wikitext analysis.
 - `max_download_bytes` bounds memory and bandwidth; oversized files are
   metadata-only.
 - `store` selects where detections go. `kind: "file"` uses `file` and
-  `cursor_file`, which must be on persistent storage on Toolforge. `kind:
+  `wikis_file`, which must be on persistent storage on Toolforge. `kind:
   "toolsdb"` uses the tool's database: an empty `database` derives
   `<tool user>__faike_p`. `replica_my_cnf` is left `null` on Toolforge, where the
   `toolforge` crate finds the credentials itself; locally point it at a copy with
   `local = 'true'` and run `toolforge-tunnel`. `pool_max`, `connect_timeout_sec`
   and `max_statement_time_sec` follow the Toolforge connection policy.
+- `DASHBOARD_TOKEN` enables `wikimisc` telemetry (component `bot` or `web`);
+  without it the service runs normally. Metrics include polls, uploads,
+  analysed files, detections per wiki, store errors, and analysis duration.
 - The default `web_address` is loopback. Set `0.0.0.0` (or use
-  `$AIMER_ADDRESS`) on Toolforge; `$AIMER_PORT` overrides the port.
+  `$FAIKE_ADDRESS`) on Toolforge; `$FAIKE_PORT` overrides the port.
 - The watcher is polite: one recent-changes poll at a time, batched imageinfo
   and wikitext requests, two concurrent downloads by default, `maxlag=5`, and
   retries with `Retry-After` on 429/5xx.
@@ -274,7 +347,7 @@ Tests cover the detector parsers with synthetic PNG/XMP/EXIF data, scoring,
 watermark DWT-DCT round-trips (including JPEG/constant-image false-positive
 guards), the optional TrustMark round-trip when models are present, AbuseFilter
 escaping/chunking, both store backends and read-only reload, the recent-changes
-parser, and the web routes (including HTML escaping). `AIMER_DEBUG=1` prints
+parser, and the web routes (including HTML escaping). `FAIKE_DEBUG=1` prints
 per-detector timings and per-file progress.
 
 `tests/corpus.rs` runs the built binary over seven permanent fixtures in
@@ -303,7 +376,7 @@ true-positive watermark path is covered by the synthetic fixture instead.
 The ToolsDB round-trip is opt-in because it needs the tunnel and credentials:
 
 ```bash
-AIMER_TOOLSDB_TEST=1 cargo test -- --ignored
+FAIKE_TOOLSDB_TEST=1 cargo test -- --ignored
 ```
 
 ## Toolforge deployment
@@ -312,8 +385,8 @@ AIMER_TOOLSDB_TEST=1 cargo test -- --ignored
 `/data/project/faike/config.json`:
 
 ```procfile
-web: AIMER_PORT=$PORT ./target/release/aimer serve /data/project/faike/config.json
-bot: ./target/release/aimer watch /data/project/faike/config.json
+web: FAIKE_ADDRESS=0.0.0.0 FAIKE_PORT=$PORT ./target/release/faike serve /data/project/faike/config.json
+bot: ./target/release/faike watch /data/project/faike/config.json
 ```
 
 Prepare the persistent paths once on the tool account:
@@ -328,21 +401,24 @@ scripts/fetch-models.sh /data/project/faike/models
 ```
 
 The database (`s58339__faike_p`) and its tables are created on first start by
-either process (`CREATE ... IF NOT EXISTS`), so a fresh deployment needs no
-manual SQL. The schema is `detections` (one row per detection; indexed by
-`timestamp`, `(score, timestamp)` and `sha1`) and `meta` (the recent-changes
-cursor).
+either process from `schema.sql` (embedded at build time), so a fresh deployment
+needs no manual SQL. The tables are `wikis` (the live wiki list plus per-wiki
+cursors), `detections` (one row per wiki/file, indexed by `timestamp`,
+`(score, timestamp)`, `sha1` and `(wiki, timestamp)`), and `meta` (seed flags).
 
-Start/restart the web service with the build-service image, then run
-`./restart.sh` for the bot job. The web service reads the ToolsDB replica and
-reloads every five seconds, so it does not compete with the bot for the primary.
-The models and ONNX Runtime are large, so the build and image are larger than a
-metadata-only deployment. Typical first launch:
+Build and deploy with the build service:
 
 ```bash
-toolforge webservice buildservice start --mount=all --health-check-path /healthz
-./restart.sh
+./build.sh                 # toolforge build start https://github.com/magnusmanske/faike/
+./webservice.sh start      # web service from the Procfile `web` entry
+./restart.sh               # bot job from the Procfile `bot` entry
 ```
+
+`webservice.sh restart` is the usual command after a rebuild. The `web` Procfile
+entry binds `0.0.0.0` and takes the port from Toolforge. The web service reads
+the ToolsDB replica and reloads every five seconds, so it does not compete with
+the bot for the primary. The models and ONNX Runtime are large, so the build and
+image are larger than a metadata-only deployment.
 
 If the build service cannot download the ONNX Runtime binaries used by
 `trustmark`, build with `--no-default-features`; the DWT-DCT detector then still
@@ -356,7 +432,6 @@ works and TrustMark is skipped.
 3. Optional neural classifiers, clearly labelled probabilistic and never used
    for `disallow`.
 4. Video/audio: sample frames/audio, reuse the image/watermark detectors.
-5. Multiple watchers, a public report page, and an on-wiki bot mode that
-   tags/notifies.
+5. An on-wiki bot mode that tags/notifies, and a public report page.
 6. C2PA trust-list validation and trust-state display (currently only
    cryptographic validity is reported; no trust anchors are configured).
