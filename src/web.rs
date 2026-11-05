@@ -5,6 +5,8 @@ use crate::config::Config;
 use crate::model::Detection;
 use crate::status::Status;
 use crate::store::{Filter, Store};
+use crate::telemetry;
+use crate::wiki::{DEFAULT_DOMAIN, Wiki};
 use anyhow::Result;
 use axum::Router;
 use axum::body::Body;
@@ -20,6 +22,8 @@ use std::time::Duration;
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 500;
 const MAX_QUERY_CHARS: usize = 200;
+/// Query value for a view across all wikis.
+const ALL_WIKIS: &str = "all";
 
 #[derive(Clone)]
 struct AppState {
@@ -30,13 +34,16 @@ struct AppState {
 
 #[derive(Debug, Default, Deserialize)]
 struct Params {
+    wiki: Option<String>,
     min_score: Option<u16>,
     q: Option<String>,
     limit: Option<usize>,
 }
 
 impl Params {
-    fn filter(&self) -> Filter {
+    /// The filter for the selected wiki. `?wiki=all` selects every wiki;
+    /// an absent or unknown value falls back to Commons.
+    fn filter(&self, wikis: &[Wiki]) -> Filter {
         let text = self
             .q
             .as_deref()
@@ -44,6 +51,7 @@ impl Params {
             .filter(|text| !text.is_empty())
             .map(|text| text.chars().take(MAX_QUERY_CHARS).collect::<String>());
         Filter {
+            wiki: selected_wiki(self, wikis),
             min_score: self.min_score.unwrap_or(0).min(100) as u8,
             text,
             limit: self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
@@ -51,8 +59,24 @@ impl Params {
     }
 }
 
+/// The wiki a request selects, or `None` for all wikis. Unknown domains fall
+/// back to Commons (or the first configured wiki if Commons was removed).
+fn selected_wiki(params: &Params, wikis: &[Wiki]) -> Option<String> {
+    match params.wiki.as_deref() {
+        Some(ALL_WIKIS) => None,
+        Some(domain) if wikis.iter().any(|wiki| wiki.domain == domain) => Some(domain.to_string()),
+        _ => wikis
+            .iter()
+            .find(|wiki| wiki.domain == DEFAULT_DOMAIN)
+            .or_else(|| wikis.first())
+            .map(|wiki| wiki.domain.clone()),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DetectionList {
+    /// Selected wiki, or `None` for all wikis.
+    wiki: Option<String>,
     count: usize,
     detections: Vec<Detection>,
 }
@@ -78,14 +102,17 @@ pub async fn run(
                 match store.reload().await {
                     Ok(()) => {
                         status.set_stored(store.count());
-                        if let Some(cursor) = store.load_cursor().await {
-                            status.set_cursor(Some(&cursor));
+                        for wiki in store.wikis() {
+                            status.set_cursor(&wiki.domain, wiki.cursor.as_ref());
                         }
                         status.clear_error();
+                        telemetry::set_stored(store.count());
+                        telemetry::set_wikis(store.wikis().len());
                     }
                     Err(error) => {
+                        telemetry::record_store_error("reload");
                         status.set_error(format!("Store reload failed: {error:#}"));
-                        eprintln!("aimer: store reload failed: {error:#}");
+                        eprintln!("faike: store reload failed: {error:#}");
                     }
                 }
             }
@@ -93,7 +120,7 @@ pub async fn run(
     }
     let address = state.config.listen_addr();
     let listener = tokio::net::TcpListener::bind(&address).await?;
-    eprintln!("aimer: listening on http://{address}");
+    eprintln!("faike: listening on http://{address}");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -105,6 +132,7 @@ fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/api/detections", get(api_detections))
         .route("/api/status", get(api_status))
+        .route("/api/wikis", get(api_wikis))
         .route("/abuse-filters", get(abuse_filters_text))
         .route("/abuse-filters.json", get(abuse_filters_json))
         .route("/healthz", get(health))
@@ -112,7 +140,9 @@ fn router(state: AppState) -> Router {
 }
 
 async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> Response {
-    let filter = params.filter();
+    telemetry::record_web_request("index");
+    let wikis = state.store.wikis();
+    let filter = params.filter(&wikis);
     let mut detections = state.store.recent(&filter);
     detections.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.score.cmp(&a.score)));
     let status = state.status.snapshot();
@@ -124,7 +154,7 @@ async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> R
     let mut html = String::with_capacity(16 * 1024);
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-    html.push_str("<title>aimer — AI upload watchdog</title>");
+    html.push_str("<title>fAIke — AI upload watchdog</title>");
     if refresh {
         let _ = write!(
             html,
@@ -133,17 +163,49 @@ async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> R
         );
     }
     html.push_str(STYLE);
-    html.push_str("</head><body><header><h1>aimer</h1>");
+    html.push_str("</head><body><header><h1>fAIke</h1>");
     html.push_str("<p>AI upload watchdog · detection is evidence, not proof.</p></header>");
+
+    html.push_str("<nav class=\"wikis\">");
+    let _ = write!(
+        html,
+        "<a class=\"{}\" href=\"/?wiki={}\">All wikis</a>",
+        if filter.wiki.is_none() { "active" } else { "" },
+        ALL_WIKIS
+    );
+    for wiki in &wikis {
+        let active = filter.wiki.as_deref() == Some(wiki.domain.as_str());
+        let _ = write!(
+            html,
+            "<a class=\"{} {}\" href=\"/?wiki={}\" title=\"{}\">{}</a>",
+            if active { "active" } else { "" },
+            if wiki.enabled { "" } else { "disabled" },
+            query_encode(&wiki.domain),
+            if wiki.enabled { "watching" } else { "disabled" },
+            escape_html(&wiki.display_name)
+        );
+    }
+    html.push_str("</nav>");
+
+    let selected_status = filter
+        .wiki
+        .as_ref()
+        .and_then(|domain| status.wikis.iter().find(|entry| &entry.wiki == domain));
+    let selected_name = filter
+        .wiki
+        .as_ref()
+        .and_then(|domain| wikis.iter().find(|wiki| &wiki.domain == domain))
+        .map(|wiki| wiki.display_name.as_str())
+        .unwrap_or("All wikis");
 
     html.push_str("<section class=\"status\">");
     let _ = write!(
         html,
-        "<span>Cursor <code>{}</code></span>",
+        "<span>{} cursor <code>{}</code></span>",
+        escape_html(selected_name),
         escape_html(
-            status
-                .cursor
-                .as_ref()
+            selected_status
+                .and_then(|entry| entry.cursor.as_ref())
                 .map(|cursor| cursor.timestamp.as_str())
                 .unwrap_or("—")
         )
@@ -167,22 +229,35 @@ async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> R
             escape_html(error)
         );
     }
+    if let Some(error) = selected_status.and_then(|entry| entry.last_error.as_ref()) {
+        let _ = write!(
+            html,
+            "<p class=\"error\">{}: {}</p>",
+            escape_html(selected_name),
+            escape_html(error)
+        );
+    }
 
+    let wiki_param = filter.wiki.as_deref().unwrap_or(ALL_WIKIS);
     let _ = write!(
         html,
         "<form method=\"get\" action=\"/\" class=\"filters\">\
+         <input type=\"hidden\" name=\"wiki\" value=\"{}\">\
          <label>Min score <input type=\"number\" name=\"min_score\" min=\"0\" max=\"100\" value=\"{}\"></label>\
          <label>Search <input type=\"search\" name=\"q\" maxlength=\"{}\" value=\"{}\" placeholder=\"title, user, tool, signal\"></label>\
          <label>Limit <input type=\"number\" name=\"limit\" min=\"1\" max=\"{}\" value=\"{}\"></label>\
          <button type=\"submit\">Filter</button>\
-         <a href=\"/abuse-filters\">AbuseFilter export</a>\
-         <a href=\"/api/detections\">JSON</a>\
+         <a href=\"/abuse-filters?wiki={}\">AbuseFilter export</a>\
+         <a href=\"/api/detections?wiki={}\">JSON</a>\
          </form>",
+        query_encode(wiki_param),
         filter.min_score,
         MAX_QUERY_CHARS,
         escape_html(params.q.as_deref().unwrap_or("")),
         MAX_LIMIT,
-        filter.limit
+        filter.limit,
+        query_encode(wiki_param),
+        query_encode(wiki_param)
     );
 
     if detections.is_empty() {
@@ -190,7 +265,7 @@ async fn index(State(state): State<AppState>, Query(params): Query<Params>) -> R
     } else {
         html.push_str(
             "<div class=\"table-wrap\"><table><thead><tr>\
-            <th>Score</th><th>File</th><th>Uploader</th><th>Time</th><th>Signals</th>\
+            <th>Score</th><th>Wiki</th><th>File</th><th>Uploader</th><th>Time</th><th>Signals</th>\
             </tr></thead><tbody>",
         );
         for detection in &detections {
@@ -210,6 +285,17 @@ fn row(detection: &Detection) -> String {
         detection.level.as_str(),
         detection.score
     );
+    if detection.wiki.is_empty() {
+        out.push('—');
+    } else {
+        let _ = write!(
+            out,
+            "<a class=\"wiki\" href=\"/?wiki={}\">{}</a>",
+            query_encode(&detection.wiki),
+            escape_html(&detection.wiki)
+        );
+    }
+    out.push_str("</td><td>");
     match safe_url(&detection.description_url) {
         Some(url) => {
             let _ = write!(
@@ -268,30 +354,49 @@ fn row(detection: &Detection) -> String {
 }
 
 async fn api_detections(State(state): State<AppState>, Query(params): Query<Params>) -> Response {
-    let filter = params.filter();
+    telemetry::record_web_request("api_detections");
+    let wikis = state.store.wikis();
+    let filter = params.filter(&wikis);
     let mut detections = state.store.recent(&filter);
     detections.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.score.cmp(&a.score)));
     json_response(&DetectionList {
+        wiki: filter.wiki,
         count: detections.len(),
         detections,
     })
 }
 
+async fn api_wikis(State(state): State<AppState>) -> Response {
+    telemetry::record_web_request("api_wikis");
+    json_response(&state.store.wikis())
+}
+
 async fn api_status(State(state): State<AppState>) -> Response {
+    telemetry::record_web_request("api_status");
     json_response(&state.status.snapshot())
 }
 
-async fn abuse_filters_text(State(state): State<AppState>) -> Response {
-    let rules = current_rules(&state);
+async fn abuse_filters_text(
+    State(state): State<AppState>,
+    Query(params): Query<Params>,
+) -> Response {
+    telemetry::record_web_request("abuse_filters");
+    let rules = current_rules(&state, &params);
     text_response(abuse_filter::text(&rules), "text/plain; charset=utf-8")
 }
 
-async fn abuse_filters_json(State(state): State<AppState>) -> Response {
-    json_response(&current_rules(&state))
+async fn abuse_filters_json(
+    State(state): State<AppState>,
+    Query(params): Query<Params>,
+) -> Response {
+    telemetry::record_web_request("abuse_filters");
+    json_response(&current_rules(&state, &params))
 }
 
-fn current_rules(state: &AppState) -> Vec<abuse_filter::Rule> {
+fn current_rules(state: &AppState, params: &Params) -> Vec<abuse_filter::Rule> {
+    let wikis = state.store.wikis();
     let detections = state.store.recent(&Filter {
+        wiki: selected_wiki(params, &wikis),
         min_score: 0,
         text: None,
         limit: usize::MAX,
@@ -300,6 +405,7 @@ fn current_rules(state: &AppState) -> Vec<abuse_filter::Rule> {
 }
 
 async fn health() -> Response {
+    telemetry::record_web_request("health");
     text_response("ok\n".to_string(), "text/plain; charset=utf-8")
 }
 
@@ -376,6 +482,20 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Percent-encode a query value. Wiki domains are ASCII, but the value comes
+/// from the database, so do not rely on that.
+fn query_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
 fn text_preview(value: &str, max: usize) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     crate::patterns::truncate(&collapsed, max)
@@ -434,6 +554,11 @@ header p { margin:.2rem 0 1rem; color:var(--muted); }
 a { color:var(--accent); }
 .status { display:flex; flex-wrap:wrap; gap:.5rem 1.2rem; padding:.6rem .8rem; border:1px solid var(--line); border-radius:.4rem; color:var(--muted); font-size:.88rem; }
 .status code { color:var(--fg); }
+.wikis { display:flex; flex-wrap:wrap; gap:.4rem; margin:.8rem 0 0; }
+.wikis a { padding:.25rem .65rem; border:1px solid var(--line); border-radius:1rem; text-decoration:none; font-size:.85rem; }
+.wikis a.active { background:var(--accent); border-color:var(--accent); color:var(--bg); }
+.wikis a.disabled { opacity:.55; text-decoration:line-through; }
+.wiki { font-size:.85rem; white-space:nowrap; }
 .error { padding:.6rem .8rem; border-left:3px solid var(--high); background:color-mix(in srgb, var(--high) 10%, transparent); }
 .filters { display:flex; flex-wrap:wrap; gap:.6rem 1rem; align-items:end; margin:1rem 0; }
 .filters label { display:flex; flex-direction:column; gap:.2rem; font-size:.85rem; color:var(--muted); }
@@ -471,7 +596,7 @@ mod tests {
         Config {
             store: crate::config::StoreConfig {
                 file: dir.path().join("detections.jsonl"),
-                cursor_file: dir.path().join("cursor.json"),
+                wikis_file: dir.path().join("wikis.json"),
                 ..crate::config::StoreConfig::default()
             },
             ..Config::default()
@@ -483,6 +608,7 @@ mod tests {
         let store = Arc::new(Store::open(&config).await.unwrap());
         let detection = Detection::new(
             "abc".into(),
+            "commons.wikimedia.org".into(),
             "File:<script>alert(1)</script>.png".into(),
             "2026-01-01T00:00:00Z".into(),
             "Example".into(),
@@ -503,6 +629,29 @@ mod tests {
             ],
         );
         store.add(detection).await.unwrap();
+        let german = Detection::new(
+            "def".into(),
+            "de.wikipedia.org".into(),
+            "File:German.png".into(),
+            "2026-01-02T00:00:00Z".into(),
+            "Beispiel".into(),
+            "mit Midjourney".into(),
+            String::new(),
+            "https://de.wikipedia.org/wiki/Datei:German.png".into(),
+            "image/png".into(),
+            2048,
+            "def".into(),
+            vec![
+                Signal::new(
+                    Source::PngText,
+                    Confidence::High,
+                    "png.parameters.prompt",
+                    "parameters",
+                )
+                .with_tool("Stable Diffusion"),
+            ],
+        );
+        store.add(german).await.unwrap();
         AppState {
             config,
             store,
@@ -551,6 +700,79 @@ mod tests {
         let json = body(response).await;
         assert!(json.contains("\"count\":1"));
         assert!(json.contains("Midjourney"));
+        assert!(!json.contains("German.png"), "Commons is the default view");
+    }
+
+    #[tokio::test]
+    async fn wiki_views_are_filtered_and_linkable() {
+        let dir = TempDir::new().unwrap();
+        let app = router(state(&dir).await);
+
+        let german = body(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/detections?wiki=de.wikipedia.org")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(german.contains("German.png"));
+        assert!(!german.contains("alert(1)"));
+
+        let all = body(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/detections?wiki=all")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(all.contains("German.png"));
+        assert!(all.contains("alert(1)"));
+
+        let html = body(
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/?wiki=de.wikipedia.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(html.contains("fAIke"));
+        assert!(html.contains("German.png"));
+        assert!(html.contains("href=\"/?wiki=de.wikipedia.org\""));
+        assert!(html.contains("English Wikipedia"));
+    }
+
+    #[tokio::test]
+    async fn api_lists_wikis() {
+        let dir = TempDir::new().unwrap();
+        let app = router(state(&dir).await);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/wikis")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body(response).await;
+        assert!(json.contains("commons.wikimedia.org"));
+        assert!(json.contains("en.wikipedia.org"));
+        assert!(json.contains("de.wikipedia.org"));
     }
 
     #[tokio::test]

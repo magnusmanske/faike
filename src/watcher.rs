@@ -1,4 +1,8 @@
 //! The upload watcher: recent changes -> metadata -> bytes -> detections.
+//!
+//! One poll cycle visits every enabled wiki from the store. The wiki list is
+//! refreshed each cycle, so adding, disabling or removing a wiki in the
+//! database takes effect without a restart.
 
 use crate::config::Config;
 use crate::detect::{self, Input, Metadata};
@@ -6,12 +10,17 @@ use crate::mediawiki::{ApiClient, Cursor, FileInfo, UploadEvent};
 use crate::model::Detection;
 use crate::status::Status;
 use crate::store::Store;
+use crate::telemetry;
+use crate::wiki::Wiki;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Shorter pause between cycles when an API reported more pages.
+const MORE_WORK_PAUSE: Duration = Duration::from_secs(1);
 
 struct Job {
     event: UploadEvent,
@@ -22,28 +31,43 @@ struct Job {
 }
 
 pub async fn run(config: Arc<Config>, store: Arc<Store>, status: Arc<Status>) {
-    let client = match ApiClient::new(&config) {
-        Ok(client) => client,
-        Err(error) => {
-            status.set_error(format!("Cannot start watcher: {error}"));
-            eprintln!("aimer: cannot start watcher: {error}");
-            return;
-        }
-    };
-    let mut cursor = store.load_cursor().await;
     loop {
-        let more = match poll_once(&config, &client, &store, &status, &mut cursor).await {
-            Ok(more) => more,
-            Err(error) => {
-                status.set_error(format!("{error:#}"));
-                eprintln!("aimer: poll failed: {error:#}");
-                false
-            }
-        };
-        if !more {
-            tokio::time::sleep(Duration::from_secs(config.poll_interval_sec)).await;
+        if let Err(error) = store.refresh_wikis().await {
+            status.set_error(format!("Wiki list refresh failed: {error:#}"));
+            eprintln!("faike: wiki list refresh failed: {error:#}");
         }
+        let wikis = store.wikis();
+        telemetry::set_wikis(wikis.len());
+        let mut more_work = false;
+        for wiki in wikis.into_iter().filter(|wiki| wiki.enabled) {
+            match poll_wiki(&config, &store, &status, &wiki).await {
+                Ok(more) => more_work |= more,
+                Err(error) => {
+                    status.set_wiki_error(&wiki.domain, format!("{error:#}"));
+                    eprintln!("faike: poll of {} failed: {error:#}", wiki.domain);
+                }
+            }
+            status.set_stored(store.count());
+            telemetry::set_stored(store.count());
+        }
+        let pause = if more_work {
+            MORE_WORK_PAUSE
+        } else {
+            Duration::from_secs(config.poll_interval_sec)
+        };
+        tokio::time::sleep(pause).await;
     }
+}
+
+async fn poll_wiki(
+    config: &Arc<Config>,
+    store: &Arc<Store>,
+    status: &Arc<Status>,
+    wiki: &Wiki,
+) -> Result<bool> {
+    let client = ApiClient::new(config, wiki)?;
+    let mut cursor = store.load_cursor(&wiki.domain).await;
+    poll_once(config, &client, store, status, wiki, &mut cursor).await
 }
 
 async fn poll_once(
@@ -51,6 +75,7 @@ async fn poll_once(
     client: &ApiClient,
     store: &Arc<Store>,
     status: &Arc<Status>,
+    wiki: &Wiki,
     cursor: &mut Option<Cursor>,
 ) -> Result<bool> {
     if cursor.is_none() {
@@ -58,21 +83,25 @@ async fn poll_once(
         status.clear_error();
         let uploads = batch.uploads.len();
         if uploads > 0 {
-            eprintln!("aimer: backfilling {uploads} upload event(s)");
+            eprintln!(
+                "faike: backfilling {uploads} upload event(s) on {}",
+                wiki.domain
+            );
         }
         if !batch.uploads.is_empty() {
-            process_batch(config, client, store, status, batch.uploads).await?;
+            process_batch(config, client, store, status, wiki, batch.uploads).await?;
         }
         if let Some(new_cursor) = &batch.cursor {
-            store.save_cursor(new_cursor).await?;
+            store.save_cursor(&wiki.domain, new_cursor).await?;
             *cursor = Some(new_cursor.clone());
         }
-        status.record_poll(uploads, cursor.as_ref());
+        status.record_poll(&wiki.domain, uploads, cursor.as_ref());
+        telemetry::record_poll(&wiki.domain, uploads);
         status.set_stored(store.count());
         if let Some(cursor) = cursor {
             eprintln!(
-                "aimer: started, cursor {} / {}",
-                cursor.timestamp, cursor.rc_id
+                "faike: started on {}, cursor {} / {}",
+                wiki.domain, cursor.timestamp, cursor.rc_id
             );
         }
         return Ok(false);
@@ -83,16 +112,17 @@ async fn poll_once(
     status.clear_error();
     let uploads = batch.uploads.len();
     if !batch.uploads.is_empty() {
-        eprintln!("aimer: {uploads} upload event(s)");
-        process_batch(config, client, store, status, batch.uploads).await?;
+        eprintln!("faike: {uploads} upload event(s) on {}", wiki.domain);
+        process_batch(config, client, store, status, wiki, batch.uploads).await?;
     }
     if let Some(new_cursor) = &batch.cursor
         && *new_cursor > current
     {
-        store.save_cursor(new_cursor).await?;
+        store.save_cursor(&wiki.domain, new_cursor).await?;
         *cursor = Some(new_cursor.clone());
     }
-    status.record_poll(uploads, cursor.as_ref());
+    status.record_poll(&wiki.domain, uploads, cursor.as_ref());
+    telemetry::record_poll(&wiki.domain, uploads);
     status.set_stored(store.count());
     Ok(batch.more)
 }
@@ -102,6 +132,7 @@ async fn process_batch(
     client: &ApiClient,
     store: &Arc<Store>,
     status: &Arc<Status>,
+    wiki: &Wiki,
     events: Vec<UploadEvent>,
 ) -> Result<()> {
     // The same file can be uploaded twice in one poll; analyse the latest
@@ -123,8 +154,8 @@ async fn process_batch(
         let wikitexts = match client.wikitext(&titles).await {
             Ok(wikitexts) => wikitexts,
             Err(error) => {
-                status.set_error(format!("Wikitext fetch failed: {error:#}"));
-                eprintln!("aimer: wikitext fetch failed: {error:#}");
+                status.set_wiki_error(&wiki.domain, format!("Wikitext fetch failed: {error:#}"));
+                eprintln!("faike: wikitext fetch failed on {}: {error:#}", wiki.domain);
                 HashMap::new()
             }
         };
@@ -132,8 +163,8 @@ async fn process_batch(
         let mut jobs = Vec::new();
         for event in chunk {
             let Some(info) = infos.remove(&event.title) else {
-                if std::env::var_os("AIMER_DEBUG").is_some() {
-                    eprintln!("aimer: no imageinfo for {}", event.title);
+                if std::env::var_os("FAIKE_DEBUG").is_some() {
+                    eprintln!("faike: no imageinfo for {}", event.title);
                 }
                 continue;
             };
@@ -142,7 +173,7 @@ async fn process_batch(
             } else {
                 info.sha1.clone()
             };
-            if store.is_seen(&id) {
+            if store.is_seen(&wiki.domain, &id) {
                 continue;
             }
             let download = config.should_download(&info.mime, info.size) && !info.url.is_empty();
@@ -166,6 +197,7 @@ async fn process_batch(
                     client.clone(),
                     store.clone(),
                     status.clone(),
+                    wiki.domain.clone(),
                     job,
                 )
             })
@@ -174,8 +206,8 @@ async fn process_batch(
             .await;
         for result in results {
             if let Err(error) = result {
-                status.set_error(format!("{error:#}"));
-                eprintln!("aimer: analysis failed: {error:#}");
+                status.set_wiki_error(&wiki.domain, format!("{error:#}"));
+                eprintln!("faike: analysis failed on {}: {error:#}", wiki.domain);
             }
         }
     }
@@ -187,15 +219,16 @@ async fn analyze_job(
     client: ApiClient,
     store: Arc<Store>,
     status: Arc<Status>,
+    wiki: String,
     job: Job,
 ) -> Result<()> {
-    if store.is_seen(&job.id) {
+    if store.is_seen(&wiki, &job.id) {
         return Ok(());
     }
-    if std::env::var_os("AIMER_DEBUG").is_some() {
+    if std::env::var_os("FAIKE_DEBUG").is_some() {
         eprintln!(
-            "aimer: analysing {} ({}, {} bytes, base36 {})",
-            job.event.title, job.info.mime, job.info.size, job.event.sha1_base36
+            "faike: analysing {} on {} ({}, {} bytes, base36 {})",
+            job.event.title, wiki, job.info.mime, job.info.size, job.event.sha1_base36
         );
     }
     let started = std::time::Instant::now();
@@ -203,17 +236,24 @@ async fn analyze_job(
         match client.download(&job.info.url).await {
             Ok(bytes) => bytes,
             Err(error) => {
-                status.set_error(format!("Download of {} failed: {error:#}", job.event.title));
-                eprintln!("aimer: download of {} failed: {error:#}", job.event.title);
+                telemetry::record_download_failure();
+                status.set_wiki_error(
+                    &wiki,
+                    format!("Download of {} failed: {error:#}", job.event.title),
+                );
+                eprintln!(
+                    "faike: download of {} on {} failed: {error:#}",
+                    job.event.title, wiki
+                );
                 Bytes::new()
             }
         }
     } else {
         Bytes::new()
     };
-    if std::env::var_os("AIMER_DEBUG").is_some() {
+    if std::env::var_os("FAIKE_DEBUG").is_some() {
         eprintln!(
-            "aimer: downloaded {} bytes for {} in {:?}",
+            "faike: downloaded {} bytes for {} in {:?}",
             bytes.len(),
             job.event.title,
             started.elapsed()
@@ -233,22 +273,24 @@ async fn analyze_job(
     })
     .await
     .context("Detector task failed")?;
-    if std::env::var_os("AIMER_DEBUG").is_some() {
+    if std::env::var_os("FAIKE_DEBUG").is_some() {
         eprintln!(
-            "aimer: detectors ran in {:?} for {}",
+            "faike: detectors ran in {:?} for {}",
             started.elapsed(),
             job.event.title
         );
     }
 
     status.record_analyzed(1);
+    telemetry::record_analysis(&wiki, started.elapsed().as_secs_f64());
     if signals.is_empty() {
-        store.mark_seen(&job.id);
+        store.mark_seen(&wiki, &job.id);
         return Ok(());
     }
 
     let detection = Detection::new(
         job.id.clone(),
+        wiki,
         job.event.title.clone(),
         job.event.timestamp.clone(),
         job.event.user.clone(),
@@ -261,15 +303,17 @@ async fn analyze_job(
         signals,
     );
     if detection.score < config.min_score {
-        store.mark_seen(&job.id);
+        store.mark_seen(&detection.wiki, &job.id);
         return Ok(());
     }
     let tool = detection.tool().unwrap_or("unknown").to_string();
     let score = detection.score;
     let title = detection.title.clone();
+    let detection_wiki = detection.wiki.clone();
+    telemetry::record_detection(&detection.wiki, score);
     if store.add(detection).await? {
         status.record_detection();
-        eprintln!("aimer: detection {score} [{tool}] {title}");
+        eprintln!("faike: detection {score} [{tool}] {title} on {detection_wiki}");
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 //! Detection store backends.
 //!
 //! Both backends share [`Cache`], the in-memory ring the web UI reads and the
-//! set of IDs already analysed. The backend persists detections and the
-//! recent-changes cursor; [`Store`] dispatches between them.
+//! set of IDs already analysed. The backend persists detections, the wiki list
+//! and the per-wiki recent-changes cursors; [`Store`] dispatches between them.
 
 mod file;
 #[cfg(feature = "toolsdb")]
@@ -16,6 +16,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::config::{Config, StoreKind};
 use crate::mediawiki::Cursor;
 use crate::model::Detection;
+use crate::wiki::Wiki;
 
 pub use file::FileStore;
 #[cfg(feature = "toolsdb")]
@@ -24,6 +25,8 @@ pub use toolsdb::ToolsDbStore;
 /// Query for [`Store::recent`].
 #[derive(Debug, Clone)]
 pub struct Filter {
+    /// Only detections for this wiki domain, or all when `None`.
+    pub wiki: Option<String>,
     pub min_score: u8,
     pub text: Option<String>,
     pub limit: usize,
@@ -32,6 +35,7 @@ pub struct Filter {
 impl Default for Filter {
     fn default() -> Self {
         Self {
+            wiki: None,
             min_score: 0,
             text: None,
             limit: 200,
@@ -81,6 +85,7 @@ impl Store {
         }
     }
 
+    /// Reload detections and the wiki list, replacing the in-memory views.
     pub async fn reload(&self) -> Result<()> {
         match self {
             Self::File(store) => store.reload().await,
@@ -89,23 +94,44 @@ impl Store {
         }
     }
 
-    pub fn is_seen(&self, id: &str) -> bool {
+    /// Refresh only the wiki list and cursors. The bot calls this each poll so
+    /// wikis added, disabled or removed in the database take effect live.
+    pub async fn refresh_wikis(&self) -> Result<()> {
         match self {
-            Self::File(store) => store.is_seen(id),
+            Self::File(store) => store.refresh_wikis().await,
             #[cfg(feature = "toolsdb")]
-            Self::ToolsDb(store) => store.is_seen(id),
+            Self::ToolsDb(store) => store.refresh_wikis().await,
         }
     }
 
-    pub fn mark_seen(&self, id: &str) {
+    /// All configured wikis, including disabled ones, newest configuration
+    /// first loaded. Sorted by `sort_order`, then domain.
+    pub fn wikis(&self) -> Vec<Wiki> {
         match self {
-            Self::File(store) => store.mark_seen(id),
+            Self::File(store) => store.wikis(),
             #[cfg(feature = "toolsdb")]
-            Self::ToolsDb(store) => store.mark_seen(id),
+            Self::ToolsDb(store) => store.wikis(),
         }
     }
 
-    /// Store a detection. Returns `false` if the id was already stored.
+    pub fn is_seen(&self, wiki: &str, id: &str) -> bool {
+        match self {
+            Self::File(store) => store.is_seen(wiki, id),
+            #[cfg(feature = "toolsdb")]
+            Self::ToolsDb(store) => store.is_seen(wiki, id),
+        }
+    }
+
+    pub fn mark_seen(&self, wiki: &str, id: &str) {
+        match self {
+            Self::File(store) => store.mark_seen(wiki, id),
+            #[cfg(feature = "toolsdb")]
+            Self::ToolsDb(store) => store.mark_seen(wiki, id),
+        }
+    }
+
+    /// Store a detection. Returns `false` if the (wiki, id) pair was already
+    /// stored.
     pub async fn add(&self, detection: Detection) -> Result<bool> {
         match self {
             Self::File(store) => store.add(detection).await,
@@ -130,24 +156,24 @@ impl Store {
         }
     }
 
-    pub async fn load_cursor(&self) -> Option<Cursor> {
+    pub async fn load_cursor(&self, wiki: &str) -> Option<Cursor> {
         match self {
-            Self::File(store) => store.load_cursor().await,
+            Self::File(store) => store.load_cursor(wiki).await,
             #[cfg(feature = "toolsdb")]
-            Self::ToolsDb(store) => store.load_cursor().await,
+            Self::ToolsDb(store) => store.load_cursor(wiki).await,
         }
     }
 
-    pub async fn save_cursor(&self, cursor: &Cursor) -> Result<()> {
+    pub async fn save_cursor(&self, wiki: &str, cursor: &Cursor) -> Result<()> {
         match self {
-            Self::File(store) => store.save_cursor(cursor).await,
+            Self::File(store) => store.save_cursor(wiki, cursor).await,
             #[cfg(feature = "toolsdb")]
-            Self::ToolsDb(store) => store.save_cursor(cursor).await,
+            Self::ToolsDb(store) => store.save_cursor(wiki, cursor).await,
         }
     }
 }
 
-/// Recent detections (newest first) and the IDs already analysed.
+/// Recent detections (newest first) and the (wiki, id) pairs already analysed.
 pub(crate) struct Cache {
     data: RwLock<CacheData>,
     max_records: usize,
@@ -161,12 +187,21 @@ struct CacheData {
     seen: HashSet<String>,
 }
 
+/// The same SHA-1 can be uploaded to two wikis; key those separately.
+fn seen_key(wiki: &str, id: &str) -> String {
+    format!("{wiki}\u{1f}{id}")
+}
+
 impl CacheData {
-    fn mark_seen(&mut self, id: &str, max_seen: usize) {
-        if id.is_empty() || !self.seen.insert(id.to_string()) {
+    fn mark_seen(&mut self, wiki: &str, id: &str, max_seen: usize) {
+        if id.is_empty() {
             return;
         }
-        self.seen_order.push_back(id.to_string());
+        let key = seen_key(wiki, id);
+        if !self.seen.insert(key.clone()) {
+            return;
+        }
+        self.seen_order.push_back(key);
         while self.seen_order.len() > max_seen {
             if let Some(old) = self.seen_order.pop_front() {
                 self.seen.remove(&old);
@@ -188,41 +223,46 @@ impl Cache {
         self.max_records
     }
 
-    /// Replace the ring with records loaded from the backend, marking their
-    /// IDs as seen. The seen set is independent of the display ring, so it
-    /// can be seeded with more IDs later if needed.
-    pub(crate) fn replace(&self, mut records: VecDeque<Detection>) {
-        while records.len() > self.max_records {
-            records.pop_back();
-        }
+    /// Replace the ring with records loaded from the backend, keeping at
+    /// most `max_records` per wiki and marking their IDs as seen.
+    pub(crate) fn replace(&self, records: VecDeque<Detection>) {
         let mut data = self.write();
         data.records = records;
+        trim_per_wiki(&mut data.records, self.max_records);
         data.seen.clear();
         data.seen_order.clear();
-        let ids: Vec<String> = data
+        let keys: Vec<(String, String)> = data
             .records
             .iter()
-            .map(|detection| detection.id.clone())
+            .map(|detection| (detection.wiki.clone(), detection.id.clone()))
             .collect();
-        for id in ids {
-            data.mark_seen(&id, self.max_seen);
+        for (wiki, id) in keys {
+            data.mark_seen(&wiki, &id, self.max_seen);
         }
     }
 
-    pub(crate) fn is_seen(&self, id: &str) -> bool {
-        self.read().seen.contains(id)
+    pub(crate) fn is_seen(&self, wiki: &str, id: &str) -> bool {
+        self.read().seen.contains(&seen_key(wiki, id))
     }
 
-    pub(crate) fn mark_seen(&self, id: &str) {
-        self.write().mark_seen(id, self.max_seen);
+    pub(crate) fn mark_seen(&self, wiki: &str, id: &str) {
+        self.write().mark_seen(wiki, id, self.max_seen);
     }
 
     pub(crate) fn push(&self, detection: Detection) {
         let mut data = self.write();
-        data.mark_seen(&detection.id, self.max_seen);
+        data.mark_seen(&detection.wiki, &detection.id, self.max_seen);
+        let wiki = detection.wiki.clone();
         data.records.push_front(detection);
-        while data.records.len() > self.max_records {
-            data.records.pop_back();
+        if data
+            .records
+            .iter()
+            .filter(|entry| entry.wiki == wiki)
+            .count()
+            > self.max_records
+            && let Some(index) = data.records.iter().rposition(|entry| entry.wiki == wiki)
+        {
+            data.records.remove(index);
         }
     }
 
@@ -231,6 +271,12 @@ impl Cache {
         let data = self.read();
         data.records
             .iter()
+            .filter(|detection| {
+                filter
+                    .wiki
+                    .as_deref()
+                    .is_none_or(|wiki| detection.wiki == wiki)
+            })
             .filter(|detection| detection.score >= filter.min_score)
             .filter(|detection| match &text {
                 Some(text) => matches(detection, text),
@@ -258,11 +304,26 @@ impl Cache {
     }
 }
 
+/// Keep the newest `max_records` entries for each wiki, preserving order.
+fn trim_per_wiki(records: &mut VecDeque<Detection>, max_records: usize) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    records.retain(|record| {
+        let count = counts.entry(record.wiki.clone()).or_default();
+        if *count < max_records {
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
 fn matches(detection: &Detection, needle: &str) -> bool {
     detection.title.to_lowercase().contains(needle)
         || detection.user.to_lowercase().contains(needle)
         || detection.comment.to_lowercase().contains(needle)
         || detection.mime.to_lowercase().contains(needle)
+        || detection.wiki.to_lowercase().contains(needle)
         || detection.signals.iter().any(|signal| {
             signal.code.to_lowercase().contains(needle)
                 || signal.detail.to_lowercase().contains(needle)
@@ -275,11 +336,12 @@ fn matches(detection: &Detection, needle: &str) -> bool {
 
 /// A simple builder for tests.
 #[cfg(test)]
-pub(crate) fn detection(id: &str, score: u8) -> Detection {
+pub(crate) fn detection(wiki: &str, id: &str, score: u8) -> Detection {
     use crate::model::{Confidence, Level, Signal, Source};
 
     Detection {
         id: id.to_string(),
+        wiki: wiki.to_string(),
         title: format!("File:{id}.png"),
         timestamp: "2026-01-01T00:00:00Z".into(),
         user: "Example".into(),
@@ -302,12 +364,27 @@ mod tests {
     #[test]
     fn text_filter_matches_signal_fields() {
         let cache = Cache::new(10);
-        cache.push(detection("abc", 90));
+        cache.push(detection("en.wikipedia.org", "abc", 90));
         let filter = Filter {
             text: Some("test".into()),
             ..Filter::default()
         };
         assert_eq!(cache.recent(&filter).len(), 1);
         assert_eq!(cache.recent(&Filter::default()).len(), 1);
+    }
+
+    #[test]
+    fn wiki_filter_and_seen_keys_are_separate() {
+        let cache = Cache::new(10);
+        cache.push(detection("commons.wikimedia.org", "same", 90));
+        cache.push(detection("de.wikipedia.org", "same", 90));
+        let filter = Filter {
+            wiki: Some("de.wikipedia.org".into()),
+            ..Filter::default()
+        };
+        assert_eq!(cache.recent(&filter).len(), 1);
+        assert!(cache.is_seen("de.wikipedia.org", "same"));
+        assert!(cache.is_seen("commons.wikimedia.org", "same"));
+        assert!(!cache.is_seen("en.wikipedia.org", "same"));
     }
 }

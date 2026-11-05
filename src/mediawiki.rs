@@ -6,6 +6,7 @@
 //! ones this tool ignores.
 
 use crate::config::Config;
+use crate::wiki::Wiki;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -75,9 +76,15 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub fn new(config: &Config, wiki: &Wiki) -> Result<Self> {
         if config.user_agent.trim().is_empty() {
             bail!("A contactable `user_agent` is required");
+        }
+        if !wiki.is_valid() {
+            bail!(
+                "Invalid wiki {}: `api_url` must be an https Action API endpoint",
+                wiki.domain
+            );
         }
         let client = Client::builder()
             .user_agent(&config.user_agent)
@@ -87,8 +94,8 @@ impl ApiClient {
             .context("Cannot build HTTP client")?;
         Ok(Self {
             client,
-            api_url: config.api_url.clone(),
-            rc_namespace: config.rc_namespace,
+            api_url: wiki.api_url.clone(),
+            rc_namespace: wiki.namespace,
             max_download_bytes: config.max_download_bytes,
             max_wikitext_bytes: config.max_wikitext_bytes,
         })
@@ -505,10 +512,10 @@ mod tests {
 
     fn client() -> ApiClient {
         let config = Config {
-            user_agent: "aimer-test/0.1 (test@example.org)".into(),
+            user_agent: "faike-test/0.1 (test@example.org)".into(),
             ..Config::default()
         };
-        ApiClient::new(&config).unwrap()
+        ApiClient::new(&config, &Wiki::defaults().remove(0)).unwrap()
     }
 
     #[test]

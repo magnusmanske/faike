@@ -3,8 +3,7 @@
   "//user_agent": "Required by Wikimedia policy: include a contactable URL or e-mail.",
   "user_agent": "faike/0.1 (https://faike.toolforge.org; you@example.org)",
 
-  "api_url": "https://commons.wikimedia.org/w/api.php",
-  "rc_namespace": 6,
+  "//wikis": "The wiki list lives in the store (ToolsDB `wikis` table or wikis.json); add, disable or remove wikis there.",
 
   "poll_interval_sec": 15,
   "backfill_events": 50,
@@ -25,7 +24,7 @@
     "kind": "toolsdb",
     "//file": "Used by the 'file' backend. Must be on persistent storage on Toolforge.",
     "file": "detections.jsonl",
-    "cursor_file": "cursor.json",
+    "wikis_file": "wikis.json",
     "//database": "Empty derives <tool user>__faike_p. ToolsDB names start with the tool user.",
     "database": "s58339__faike_p",
     "//replica_my_cnf": "On Toolforge leave null: toolforge finds $TOOL_DATA_DIR/replica.my.cnf. For local tests point at a copy with local='true' and run toolforge-tunnel.",
@@ -35,7 +34,7 @@
     "max_statement_time_sec": 30
   },
 
-  "//web_address": "Use 0.0.0.0 on Toolforge, or set AIMER_ADDRESS.",
+  "//web_address": "Use 0.0.0.0 on Toolforge, or set FAIKE_ADDRESS.",
   "web_address": "127.0.0.1",
   "web_port": 8000,
   "refresh_sec": 60,
@@ -48,7 +47,7 @@
     "container": true,
     "metadata": true,
     "watermark": {
-      "//models_dir": "Run scripts/fetch-models.sh /data/project/aimer/models first.",
+      "//models_dir": "Run scripts/fetch-models.sh /data/project/faike/models first.",
       "enabled": true,
       "dwt_dct": true,
       "trustmark": true,

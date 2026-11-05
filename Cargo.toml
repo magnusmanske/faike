@@ -1,5 +1,5 @@
 [package]
-name = "aimer"
+name = "faike"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
@@ -27,11 +27,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 # ToolsDB pools, credentials and the matching mysql_async version.
 toolforge = { version = "6.2", default-features = false, features = ["wikipool"], optional = true }
 trustmark = { version = "0.4", optional = true }
+# Metrics and health pushes for the bot and the web service.
+wikimisc = { git = "https://github.com/magnusmanske/wikimisc", features = ["logging", "telemetry"], optional = true }
 
 [features]
-default = ["trustmark", "toolsdb"]
+default = ["trustmark", "toolsdb", "telemetry"]
 trustmark = ["dep:trustmark"]
 toolsdb = ["dep:toolforge"]
+telemetry = ["dep:wikimisc"]
 
 [dev-dependencies]
 tempfile = "3"

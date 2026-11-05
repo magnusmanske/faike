@@ -19,7 +19,7 @@ use std::time::Instant;
 
 fn debug_enabled() -> bool {
     static DEBUG: OnceLock<bool> = OnceLock::new();
-    *DEBUG.get_or_init(|| std::env::var_os("AIMER_DEBUG").is_some())
+    *DEBUG.get_or_init(|| std::env::var_os("FAIKE_DEBUG").is_some())
 }
 
 macro_rules! timed {
@@ -28,7 +28,7 @@ macro_rules! timed {
         let result = $expression;
         if debug_enabled() {
             eprintln!(
-                "aimer: detector {} -> {} signal(s) in {:?}",
+                "faike: detector {} -> {} signal(s) in {:?}",
                 $name,
                 result.len(),
                 started.elapsed()

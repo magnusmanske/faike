@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// MediaWiki Action API endpoint. Defaults to Wikimedia Commons.
-    pub api_url: String,
     /// Contactable User-Agent, required for the watcher (Wikimedia policy).
     pub user_agent: String,
     /// Seconds between recent-changes polls.
@@ -17,8 +15,6 @@ pub struct Config {
     pub backfill_events: usize,
     /// Recent-changes rows per request (API maximum for normal users is 500).
     pub max_batch: usize,
-    /// Namespace to watch for uploads. Wikimedia Commons uses 6 (File).
-    pub rc_namespace: i32,
     /// Skip files larger than this.
     pub max_download_bytes: u64,
     /// Concurrent file downloads.
@@ -47,12 +43,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_url: "https://commons.wikimedia.org/w/api.php".to_string(),
             user_agent: String::new(),
             poll_interval_sec: 15,
             backfill_events: 50,
             max_batch: 500,
-            rc_namespace: 6,
             max_download_bytes: 64 * 1024 * 1024,
             download_concurrency: 2,
             download_mime_prefixes: vec!["image/".to_string()],
@@ -87,8 +81,8 @@ pub struct StoreConfig {
     pub kind: StoreKind,
     /// JSONL store for the `file` backend.
     pub file: PathBuf,
-    /// Recent-changes cursor for the `file` backend.
-    pub cursor_file: PathBuf,
+    /// Wiki list and cursors for the `file` backend.
+    pub wikis_file: PathBuf,
     /// ToolsDB database. Empty derives `<tool user>__faike_p`.
     pub database: String,
     /// Credentials file; `None` lets the `toolforge` crate search the usual
@@ -106,7 +100,7 @@ impl Default for StoreConfig {
         Self {
             kind: StoreKind::File,
             file: PathBuf::from("detections.jsonl"),
-            cursor_file: PathBuf::from("cursor.json"),
+            wikis_file: PathBuf::from("wikis.json"),
             database: String::new(),
             replica_my_cnf: None,
             pool_max: 3,
@@ -232,9 +226,6 @@ impl Config {
                  Wikimedia requires a contactable User-Agent"
             );
         }
-        if !self.api_url.starts_with("http://") && !self.api_url.starts_with("https://") {
-            bail!("`api_url` must be an http(s) URL");
-        }
         if self.download_mime_prefixes.is_empty() {
             bail!(
                 "`download_mime_prefixes` must not be empty; use [\"image/\"] to analyse images only"
@@ -255,8 +246,8 @@ impl Config {
     }
 
     pub fn listen_addr(&self) -> String {
-        let address = std::env::var("AIMER_ADDRESS").unwrap_or_else(|_| self.web_address.clone());
-        let port = std::env::var("AIMER_PORT")
+        let address = std::env::var("FAIKE_ADDRESS").unwrap_or_else(|_| self.web_address.clone());
+        let port = std::env::var("FAIKE_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(self.web_port);
@@ -271,7 +262,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let config = Config::default();
-        assert_eq!(config.api_url, "https://commons.wikimedia.org/w/api.php");
+        assert_eq!(config.user_agent, "");
         assert_eq!(config.max_batch, 500);
         assert!(config.detect.c2pa);
     }
@@ -310,6 +301,14 @@ mod tests {
         assert_eq!(config.store.pool_max, 1);
         assert_eq!(config.store.connect_timeout_sec, 1);
         assert_eq!(config.store.max_statement_time_sec, 600);
+    }
+
+    #[test]
+    fn the_template_parses() {
+        let raw = include_str!("../config.json.template");
+        let config: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(config.store.kind, StoreKind::Toolsdb);
+        assert_eq!(config.store.database, "s58339__faike_p");
     }
 
     #[test]

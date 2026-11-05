@@ -2,6 +2,7 @@
 /config.json
 /detections.jsonl
 /cursor.json
+/wikis.json
 /audits/
 /models/
 

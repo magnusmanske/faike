@@ -6,8 +6,10 @@ mod model;
 mod patterns;
 mod status;
 mod store;
+mod telemetry;
 mod watcher;
 mod web;
+mod wiki;
 
 use anyhow::{Context, Result, bail};
 use config::Config;
@@ -16,7 +18,7 @@ use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 
-const USAGE: &str = "Usage: aimer <run|watch|serve|scan|calibrate> [config.json | files]\n\
+const USAGE: &str = "Usage: faike <run|watch|serve|scan|calibrate> [config.json | files]\n\
     run [config]        watch uploads and serve the web UI\n\
     watch [config]      watch uploads only (bot process)\n\
     serve [config]      serve the web UI from an existing detection store\n\
@@ -26,7 +28,7 @@ const USAGE: &str = "Usage: aimer <run|watch|serve|scan|calibrate> [config.json 
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("aimer: {error:#}");
+        eprintln!("faike: {error:#}");
         std::process::exit(1);
     }
 }
@@ -36,10 +38,14 @@ async fn run() -> Result<()> {
     let command = args.get(1).map(String::as_str).unwrap_or("");
     match command {
         "run" => {
+            telemetry::start_bot();
             let config = Arc::new(load_config(&args)?);
             config.validate_for_run()?;
             let store = Arc::new(store::Store::open(&config).await?);
             let status = Arc::new(status::Status::new());
+            for wiki in store.wikis() {
+                status.set_cursor(&wiki.domain, wiki.cursor.as_ref());
+            }
             let watcher_config = config.clone();
             let watcher_store = store.clone();
             let watcher_status = status.clone();
@@ -49,10 +55,14 @@ async fn run() -> Result<()> {
             web::run(config, store, status, false).await
         }
         "watch" => {
+            telemetry::start_bot();
             let config = Arc::new(load_config(&args)?);
             config.validate_for_run()?;
             let store = Arc::new(store::Store::open(&config).await?);
             let status = Arc::new(status::Status::new());
+            for wiki in store.wikis() {
+                status.set_cursor(&wiki.domain, wiki.cursor.as_ref());
+            }
             tokio::select! {
                 _ = watcher::run(config, store, status) => {},
                 _ = web::shutdown_signal() => {},
@@ -60,11 +70,12 @@ async fn run() -> Result<()> {
             Ok(())
         }
         "serve" => {
+            telemetry::start_web();
             let config = Arc::new(load_config(&args)?);
             let store = Arc::new(store::Store::open_read_only(&config).await?);
             let status = Arc::new(status::Status::new());
-            if let Some(cursor) = store.load_cursor().await {
-                status.set_cursor(Some(&cursor));
+            for wiki in store.wikis() {
+                status.set_cursor(&wiki.domain, wiki.cursor.as_ref());
             }
             web::run(config, store, status, true).await
         }
@@ -100,7 +111,7 @@ fn load_config(args: &[String]) -> Result<Config> {
     let path = args
         .get(2)
         .cloned()
-        .or_else(|| std::env::var("AIMER_CONFIG").ok())
+        .or_else(|| std::env::var("FAIKE_CONFIG").ok())
         .unwrap_or_else(|| "config.json".to_string());
     Config::load(path)
 }
@@ -169,7 +180,7 @@ async fn calibrate(path: &str) -> Result<()> {
 }
 
 fn optional_config() -> Config {
-    let path = std::env::var("AIMER_CONFIG").unwrap_or_else(|_| "config.json".to_string());
+    let path = std::env::var("FAIKE_CONFIG").unwrap_or_else(|_| "config.json".to_string());
     Config::load(path).unwrap_or_default()
 }
 

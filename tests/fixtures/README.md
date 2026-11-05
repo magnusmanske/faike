@@ -42,5 +42,5 @@ them into the gitignored `models/` directory.
 
 `audits/fetch_corpus.py` (gitignored scratch) lists and downloads files from
 `Category:AI-generated_media` subcategories using the Commons API, politely and
-with `maxlag`. `audits/run_corpus.py` then runs `aimer scan`/`calibrate` and
+with `maxlag`. `audits/run_corpus.py` then runs `faike scan`/`calibrate` and
 writes `audits/corpus/results.json`.

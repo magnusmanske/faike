@@ -149,6 +149,9 @@ impl Signal {
 pub struct Detection {
     /// Lowercase hex SHA-1, or a synthetic id if the API did not provide one.
     pub id: String,
+    /// Domain of the wiki the file was uploaded to, e.g. `commons.wikimedia.org`.
+    #[serde(default)]
+    pub wiki: String,
     pub title: String,
     pub timestamp: String,
     pub user: String,
@@ -173,6 +176,7 @@ impl Detection {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
+        wiki: String,
         title: String,
         timestamp: String,
         user: String,
@@ -187,6 +191,7 @@ impl Detection {
         let score = score(&signals);
         Self {
             id,
+            wiki,
             title,
             timestamp,
             user,

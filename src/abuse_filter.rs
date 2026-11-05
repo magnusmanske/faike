@@ -85,7 +85,7 @@ pub fn rules(detections: &[Detection], min_score: u8) -> Vec<Rule> {
         };
         rules.push(Rule {
             name: format!("Known AI file SHA-1{suffix}"),
-            description: "Exact byte-for-byte match of a file aimer flagged as AI-generated."
+            description: "Exact byte-for-byte match of a file faike flagged as AI-generated."
                 .to_string(),
             expression,
             actions: ACTIONS.iter().map(|action| (*action).to_string()).collect(),
@@ -121,7 +121,7 @@ fn abuse_filter_string(regex: &str) -> String {
 /// Human-readable form for copy/paste into the AbuseFilter editor.
 pub fn text(rules: &[Rule]) -> String {
     let mut out = String::new();
-    out.push_str("# aimer — AbuseFilter suggestions\n");
+    out.push_str("# fAIke — AbuseFilter suggestions\n");
     out.push_str("# AbuseFilter cannot inspect EXIF/XMP/C2PA. Rule 1-4 match the upload\n");
     out.push_str("# description/summary; the SHA-1 rules match known file contents.\n");
     out.push_str("# Start with warn/tag. Do not disallow on metadata alone.\n\n");
@@ -147,6 +147,7 @@ mod tests {
     fn detection(sha1: &str, score: u8) -> Detection {
         Detection {
             id: sha1.to_string(),
+            wiki: "commons.wikimedia.org".into(),
             title: "File:Test.png".into(),
             timestamp: "2026-01-01T00:00:00Z".into(),
             user: "Example".into(),
@@ -219,7 +220,7 @@ mod tests {
     #[test]
     fn text_output_is_pasteable() {
         let output = text(&rules(&[], 80));
-        assert!(output.contains("# aimer"));
+        assert!(output.contains("# fAIke"));
         assert!(output.contains("## 1."));
         assert!(output.contains("Suggested actions: warn, tag"));
     }

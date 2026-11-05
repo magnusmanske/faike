@@ -69,22 +69,22 @@ fn config(dir: &TempDir) -> PathBuf {
     let path = dir.path().join("config.json");
     std::fs::write(
         &path,
-        r#"{"detect":{"watermark":{"models_dir":"/nonexistent/aimer-models"}}}"#,
+        r#"{"detect":{"watermark":{"models_dir":"/nonexistent/faike-models"}}}"#,
     )
     .expect("write test config");
     path
 }
 
 fn scan(config: &Path, file: &Path) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_aimer"))
+    let output = Command::new(env!("CARGO_BIN_EXE_faike"))
         .arg("scan")
         .arg(file)
-        .env("AIMER_CONFIG", config)
+        .env("FAIKE_CONFIG", config)
         .output()
-        .expect("run aimer");
+        .expect("run faike");
     assert!(
         output.status.success(),
-        "aimer scan failed: {}",
+        "faike scan failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("scan output is JSON")

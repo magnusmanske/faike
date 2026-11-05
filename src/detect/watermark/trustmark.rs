@@ -49,7 +49,7 @@ mod enabled {
                 let variant = config.trustmark_variant.parse::<Variant>().ok()?;
                 let Some((version, _)) = parse_version(&config.trustmark_version) else {
                     eprintln!(
-                        "aimer: TrustMark disabled; unknown version {:?}",
+                        "faike: TrustMark disabled; unknown version {:?}",
                         config.trustmark_version
                     );
                     return None;
@@ -58,7 +58,7 @@ mod enabled {
                 let decoder = config.models_dir.join(format!("decoder_{variant}.onnx"));
                 if !encoder.exists() || !decoder.exists() {
                     eprintln!(
-                        "aimer: TrustMark disabled; missing {} or {} (run scripts/fetch-models.sh)",
+                        "faike: TrustMark disabled; missing {} or {} (run scripts/fetch-models.sh)",
                         encoder.display(),
                         decoder.display()
                     );
@@ -66,16 +66,16 @@ mod enabled {
                 }
                 match Trustmark::new(&config.models_dir, variant, version) {
                     Ok(model) => {
-                        if std::env::var_os("AIMER_DEBUG").is_some() {
+                        if std::env::var_os("FAIKE_DEBUG").is_some() {
                             eprintln!(
-                                "aimer: TrustMark model loaded from {}",
+                                "faike: TrustMark model loaded from {}",
                                 config.models_dir.display()
                             );
                         }
                         Some(Arc::new(model))
                     }
                     Err(error) => {
-                        eprintln!("aimer: TrustMark model failed to load: {error}");
+                        eprintln!("faike: TrustMark model failed to load: {error}");
                         None
                     }
                 }
@@ -114,9 +114,9 @@ mod enabled {
                 .with_tool("TrustMark"),
             ],
             Ok(payload) => {
-                if std::env::var_os("AIMER_DEBUG").is_some() {
+                if std::env::var_os("FAIKE_DEBUG").is_some() {
                     eprintln!(
-                        "aimer: TrustMark decoded a {}-bit payload (expected {expected_bits}); ignored",
+                        "faike: TrustMark decoded a {}-bit payload (expected {expected_bits}); ignored",
                         payload.len()
                     );
                 }
@@ -124,8 +124,8 @@ mod enabled {
             }
             Err(trustmark::Error::CorruptWatermark) => Vec::new(),
             Err(error) => {
-                if std::env::var_os("AIMER_DEBUG").is_some() {
-                    eprintln!("aimer: TrustMark decode failed: {error}");
+                if std::env::var_os("FAIKE_DEBUG").is_some() {
+                    eprintln!("faike: TrustMark decode failed: {error}");
                 }
                 Vec::new()
             }
@@ -203,7 +203,7 @@ pub fn report(_image: DynamicImage, _config: &WatermarkConfig) -> Report {
     Report {
         available: false,
         payload: None,
-        error: Some("aimer was built without the `trustmark` feature".to_string()),
+        error: Some("faike was built without the `trustmark` feature".to_string()),
     }
 }
 
