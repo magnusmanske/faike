@@ -7,9 +7,10 @@
 //!
 //! The model is not bundled. `scripts/fetch-classifier.sh` downloads the
 //! Swin-based `SMOGY-Ai-images-detector` ONNX export (label 0 = artificial,
-//! label 1 = human), which uses ImageNet normalization and 224×224 input.
-//! Other single-image classification models with the same layout work too; set
-//! `classifier.ai_label` and `classifier.threshold` accordingly.
+//! label 1 = human), which uses ImageNet normalization and 224×224 input and
+//! is licensed CC-BY-NC-4.0. Other single-image classification models with the
+//! same layout work too; set `classifier.ai_label` and `classifier.threshold`
+//! accordingly.
 
 use crate::config::ClassifierConfig;
 use crate::detect::Input;

@@ -334,7 +334,9 @@ See `config.json.template`. Key points:
   missing, the detector is skipped. `threshold` defaults to 0.95, `ai_label`
   selects the "artificial" output index (0 for the bundled Swin model). The
   classifier runs only when the structured detectors found nothing, and skips
-  camera photos and images with an extreme aspect ratio.
+  camera photos and images with an extreme aspect ratio. The model
+  (`SMOGY/SMOGY-Ai-images-detector`, converted by `onnx-community`) is
+  CC-BY-NC-4.0 and is downloaded, not redistributed.
 - `detect.fingerprint` is the low-confidence exact-size heuristic. It is on by
   default; set it to `false` to suppress its 30-point signals.
 - `DASHBOARD_TOKEN` enables `wikimisc` telemetry (component `bot` or `web`);

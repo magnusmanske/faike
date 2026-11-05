@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Fetch the optional AI-image classifier used by `detect.classifier`.
 # Usage: scripts/fetch-classifier.sh [models-dir]
-# The model is an ONNX export of SMOGY/SMOGY-Ai-images-detector (MIT).
+# The model is an ONNX export of SMOGY/SMOGY-Ai-images-detector, licensed
+# CC-BY-NC-4.0 (attribution: Smogy; base model Organika/sdxl-detector).
+# It is not bundled or redistributed by this repository.
 set -euo pipefail
 
 directory="${1:-models}"
