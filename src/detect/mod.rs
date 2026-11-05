@@ -5,9 +5,11 @@
 //! evidence for display.
 
 pub mod c2pa;
+pub mod classifier;
 pub mod container;
 pub mod description;
 pub mod exif;
+pub mod fingerprint;
 pub mod png;
 pub mod watermark;
 pub mod xmp;
@@ -77,6 +79,18 @@ pub fn detect(input: &Input, config: &DetectConfig) -> Vec<Signal> {
         // when they found nothing, so one piece of evidence counts once.
         if config.container && signals.is_empty() {
             signals.extend(timed!("container", container::detect(input)));
+        }
+        // A classifier is the only content-level fallback for files whose
+        // provenance was stripped. Run it before the size heuristic, which is
+        // weaker still.
+        if config.classifier.enabled && signals.is_empty() {
+            signals.extend(timed!(
+                "classifier",
+                classifier::detect(input, &config.classifier)
+            ));
+        }
+        if config.fingerprint && signals.is_empty() {
+            signals.extend(timed!("fingerprint", fingerprint::detect(input)));
         }
         if config.watermark.enabled {
             signals.extend(timed!(

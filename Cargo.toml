@@ -17,7 +17,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 infer = "0.22"
 memchr = "2"
 miniz_oxide = "0.8"
+ndarray = { version = "0.16", optional = true }
 nom-exif = "3.8"
+# Optional ONNX classifier; the same runtime version as `trustmark`.
+ort = { version = "=2.0.0-rc.10", optional = true }
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "gzip", "query", "stream"] }
 roxmltree = "0.21"
@@ -31,10 +34,11 @@ trustmark = { version = "0.4", optional = true }
 wikimisc = { git = "https://github.com/magnusmanske/wikimisc", features = ["logging", "telemetry"], optional = true }
 
 [features]
-default = ["trustmark", "toolsdb", "telemetry"]
+default = ["trustmark", "toolsdb", "telemetry", "classifier"]
 trustmark = ["dep:trustmark"]
 toolsdb = ["dep:toolforge"]
 telemetry = ["dep:wikimisc"]
+classifier = ["dep:ort", "dep:ndarray"]
 
 [dev-dependencies]
 tempfile = "3"

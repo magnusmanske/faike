@@ -83,6 +83,10 @@ pub enum Source {
     PngText,
     /// Raw container bytes, used as a fallback.
     Container,
+    /// Generator-size/EXIF-shape heuristic.
+    Fingerprint,
+    /// Neural image classifier.
+    Classifier,
     /// MediaWiki `extmetadata` (Commons description-page metadata).
     Metadata,
     /// File-page wikitext.
@@ -101,6 +105,8 @@ impl Source {
             Self::Exif => "EXIF",
             Self::PngText => "PNG text",
             Self::Container => "container",
+            Self::Fingerprint => "fingerprint",
+            Self::Classifier => "classifier",
             Self::Metadata => "description",
             Self::Wikitext => "wikitext",
             Self::Comment => "comment",

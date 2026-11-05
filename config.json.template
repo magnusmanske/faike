@@ -45,7 +45,16 @@
     "xmp": true,
     "png_text": true,
     "container": true,
+    "fingerprint": true,
     "metadata": true,
+    "classifier": {
+      "//model_path": "Run scripts/fetch-classifier.sh models first. Optional: skipped when the file is absent.",
+      "enabled": true,
+      "model_path": "models/ai-image-detector.onnx",
+      "input_size": 224,
+      "ai_label": 0,
+      "threshold": 0.95
+    },
     "watermark": {
       "//models_dir": "Run scripts/fetch-models.sh /data/project/faike/models first.",
       "enabled": true,
@@ -56,7 +65,7 @@
       "trustmark_version": "Bch5",
       "dwt_match_threshold": 0.85,
       "dwt_margin_threshold": 0.35,
-      "dwt_generic_margin_threshold": 0.80,
+      "dwt_generic_margin_threshold": 0.90,
       "dwt_lock_threshold": 0.60
     }
   }

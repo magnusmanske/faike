@@ -64,6 +64,35 @@ pub fn detect(input: &Input) -> Vec<Signal> {
     signals
 }
 
+/// Shape flags used by the generator-fingerprint heuristic.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Flags {
+    /// A camera maker or model is present.
+    pub camera: bool,
+    /// A `Software` or `ProcessingSoftware` tag is present.
+    pub software: bool,
+}
+
+/// Parse just the flags the fingerprint detector needs. Returns the default
+/// (no camera, no software) when the file has no parseable EXIF.
+pub fn flags(bytes: &[u8]) -> Flags {
+    let Ok(source) = MediaSource::from_memory(bytes::Bytes::copy_from_slice(bytes)) else {
+        return Flags::default();
+    };
+    let Ok(metadata) = MediaParser::new().parse_image_metadata(source) else {
+        return Flags::default();
+    };
+    let metadata: ImageMetadata<Exif> = metadata.into();
+    let Some(exif) = metadata.exif else {
+        return Flags::default();
+    };
+    Flags {
+        camera: exif.get(ExifTag::Make).is_some() || exif.get(ExifTag::Model).is_some(),
+        software: exif.get(ExifTag::Software).is_some()
+            || exif.get(ExifTag::ProcessingSoftware).is_some(),
+    }
+}
+
 /// Inspect one EXIF field.
 fn scan_value(label: &str, weight: u8, code: &'static str, value: &str) -> Vec<Signal> {
     let mut signals = Vec::new();

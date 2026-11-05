@@ -15,27 +15,8 @@ const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEX_XMP: usize = 4 * 1024 * 1024;
 
 pub fn detect(input: &Input) -> Vec<Signal> {
-    if !input.bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Vec::new();
-    }
     let mut signals = Vec::new();
-    let mut position = 8;
-    while position + 12 <= input.bytes.len() {
-        let Some(length_bytes) = input.bytes.get(position..position + 4) else {
-            break;
-        };
-        let length = u32::from_be_bytes(length_bytes.try_into().unwrap_or([0; 4])) as usize;
-        let Some(end) = position
-            .checked_add(12)
-            .and_then(|start| start.checked_add(length))
-        else {
-            break;
-        };
-        if end > input.bytes.len() {
-            break;
-        }
-        let kind = &input.bytes[position + 4..position + 8];
-        let body = &input.bytes[position + 8..position + 8 + length];
+    for_each_chunk(input.bytes, |kind, body| {
         match kind {
             b"tEXt" => {
                 if let Some((keyword, text)) = parse_text(body) {
@@ -52,12 +33,54 @@ pub fn detect(input: &Input) -> Vec<Signal> {
                     signals.extend(check_text(&keyword, &text));
                 }
             }
-            b"IEND" => break,
             _ => {}
+        }
+        kind != b"IEND"
+    });
+    signals
+}
+
+/// Whether the PNG carries any tEXt/zTXt/iTXt chunk. The fingerprint heuristic
+/// uses this: an annotated image is not a bare generator export.
+pub fn has_text_chunks(bytes: &[u8]) -> bool {
+    let mut found = false;
+    for_each_chunk(bytes, |kind, _| {
+        if matches!(kind, b"tEXt" | b"zTXt" | b"iTXt") {
+            found = true;
+            return false;
+        }
+        kind != b"IEND"
+    });
+    found
+}
+
+/// Walk the PNG chunks, stopping when `visit` returns `false`.
+fn for_each_chunk(bytes: &[u8], mut visit: impl FnMut(&[u8], &[u8]) -> bool) {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return;
+    }
+    let mut position = 8;
+    while position + 12 <= bytes.len() {
+        let Some(length_bytes) = bytes.get(position..position + 4) else {
+            break;
+        };
+        let length = u32::from_be_bytes(length_bytes.try_into().unwrap_or([0; 4])) as usize;
+        let Some(end) = position
+            .checked_add(12)
+            .and_then(|start| start.checked_add(length))
+        else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        let kind = &bytes[position + 4..position + 8];
+        let body = &bytes[position + 8..position + 8 + length];
+        if !visit(kind, body) {
+            break;
         }
         position = end;
     }
-    signals
 }
 
 fn split_nul(bytes: &[u8]) -> Option<(&[u8], &[u8])> {

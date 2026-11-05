@@ -63,13 +63,13 @@ fn fixture(file: &str) -> PathBuf {
         .join(file)
 }
 
-/// A config without TrustMark models, so the tests do not depend on the
-/// ~63 MB downloads or on whatever config the developer has locally.
+/// A config without ONNX models or heuristics, so the tests do not depend on
+/// the ~156 MB downloads or on whatever config the developer has locally.
 fn config(dir: &TempDir) -> PathBuf {
     let path = dir.path().join("config.json");
     std::fs::write(
         &path,
-        r#"{"detect":{"watermark":{"models_dir":"/nonexistent/faike-models"}}}"#,
+        r#"{"detect":{"classifier":{"enabled":false},"fingerprint":false,"watermark":{"models_dir":"/nonexistent/faike-models"}}}"#,
     )
     .expect("write test config");
     path
@@ -100,6 +100,49 @@ fn has_code(scan: &Value, code: &str) -> bool {
     scan["signals"]
         .as_array()
         .is_some_and(|signals| signals.iter().any(|signal| signal["code"] == code))
+}
+
+fn corpus(config: &Path, index: &Path, bytes_only: bool) -> (Vec<Value>, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_faike"));
+    command.arg("corpus").arg(index).env("FAIKE_CONFIG", config);
+    if bytes_only {
+        command.arg("--bytes-only");
+    }
+    let output = command.output().expect("run faike corpus");
+    assert!(
+        output.status.success(),
+        "faike corpus failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let values = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("corpus output is JSONL"))
+        .collect();
+    (values, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn corpus_uses_mediawiki_metadata() {
+    let dir = TempDir::new().unwrap();
+    let config = config(&dir);
+    let index_path = dir.path().join("index.json");
+    let path = fixture("ordinary.jpg").display().to_string();
+    let index = serde_json::json!({
+        "File:Test.jpg": {
+            "path": path,
+            "extmetadata": {"ImageDescription": "This is an AI-generated image"}
+        }
+    });
+    std::fs::write(&index_path, index.to_string()).unwrap();
+
+    let (values, summary) = corpus(&config, &index_path, false);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["score"], 60);
+    assert!(has_code(&values[0], "description.ai_phrase"));
+    assert!(summary.contains("1 files, 1 with signals"), "{summary}");
+
+    let (values, _) = corpus(&config, &index_path, true);
+    assert_eq!(values[0]["score"], 0);
 }
 
 #[test]

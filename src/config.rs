@@ -119,10 +119,40 @@ pub struct DetectConfig {
     pub png_text: bool,
     /// Raw-bytes fallback for malformed or unusual containers.
     pub container: bool,
+    /// Generator-size/EXIF-shape heuristic (low confidence).
+    pub fingerprint: bool,
+    /// Optional neural classifier for files with stripped provenance.
+    pub classifier: ClassifierConfig,
     /// Commons `extmetadata`, file-page wikitext and upload comment.
     pub metadata: bool,
     /// Pixel-level watermark detection (expensive; independent of metadata).
     pub watermark: WatermarkConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClassifierConfig {
+    pub enabled: bool,
+    /// ONNX image classifier. Not bundled; see `scripts/fetch-classifier.sh`.
+    pub model_path: PathBuf,
+    /// Square input size. The bundled Swin model uses 224.
+    pub input_size: u32,
+    /// Output index of the AI-generated class.
+    pub ai_label: usize,
+    /// Probability above which the classifier reports a Medium signal.
+    pub threshold: f64,
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_path: PathBuf::from("models/ai-image-detector.onnx"),
+            input_size: 224,
+            ai_label: 0,
+            threshold: 0.95,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,7 +190,7 @@ impl Default for WatermarkConfig {
             trustmark_version: "Bch5".to_string(),
             dwt_match_threshold: 0.85,
             dwt_margin_threshold: 0.35,
-            dwt_generic_margin_threshold: 0.80,
+            dwt_generic_margin_threshold: 0.90,
             dwt_lock_threshold: 0.60,
         }
     }
@@ -174,6 +204,8 @@ impl Default for DetectConfig {
             xmp: true,
             png_text: true,
             container: true,
+            fingerprint: true,
+            classifier: ClassifierConfig::default(),
             metadata: true,
             watermark: WatermarkConfig::default(),
         }
@@ -215,6 +247,8 @@ impl Config {
             .clamp(0.0, 1.0);
         self.detect.watermark.dwt_lock_threshold =
             self.detect.watermark.dwt_lock_threshold.clamp(0.0, 1.0);
+        self.detect.classifier.input_size = self.detect.classifier.input_size.clamp(64, 1024);
+        self.detect.classifier.threshold = self.detect.classifier.threshold.clamp(0.0, 1.0);
     }
 
     /// Checks needed before starting the watcher. The web server itself can run
