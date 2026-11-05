@@ -48,7 +48,7 @@ section below.
 | Container fallback | AI source-type/AI-system strings in malformed or unusual containers; SVG metadata | High for explicit source types, lower for text |
 | Stable Diffusion DWT-DCT watermark | `StableDiffusionV1` (136 bits), `SDV1`/`SDXL` (32 bits), unknown-periodicity marks | High for a known payload, Medium for an unknown stable mark |
 | Adobe TrustMark | decoder payload with the configured BCH schema | Medium (provenance, not necessarily AI) |
-| ONNX AI-image classifier | optional Swin classifier for stripped files; catches many photorealistic Midjourney/Flux/Imagen/SD exports | Medium at ≥95%; probabilistic, weak on charts/diagrams |
+| ONNX AI-image classifier | two independently trained models (Swin + Community Forensics ViT); flags stripped files when both agree | Medium; probabilistic, weak on charts/diagrams |
 | Generator-size heuristic | exact common output sizes (1024×1024, 1536×768, …) with no camera/software metadata or PNG text | Low |
 | Wikimedia `extmetadata` | `Software`, `ImageDescription`, `Credit`, `Artist`, `Categories` | Medium to High for `Software` |
 | File-page wikitext | `{{PD-algorithm}}`, `{{AI-generated}}`, `{{Created with Midjourney}}`, AI categories | High |
@@ -282,9 +282,14 @@ images as a negative control:
 - `dwt_lock_threshold = 0.60`: genuine encodes were 0.66–0.84; ordinary images
   were ~0.45. This guard is essential: a constant or JPEG-flattened image
   produces unanimous zero bits (margin 1.0) without any watermark.
-- `classifier.threshold = 0.95`: all 35 classifier hits on the positive corpus
-  were at least 97%, while the weakest negative hit was 83%. Lowering the
-  threshold adds false positives without gaining corpus recall.
+- `classifier.primary.threshold = 0.95`: with the primary model alone, all 35
+  classifier hits on the positive corpus were at least 97%, while the weakest
+  hit on the ordinary negative set was 83%. Lowering it adds false positives
+  without gaining corpus recall. `classifier.secondary.threshold = 0.65`: the secondary model is
+  a single-logit model, and its score is on a different calibration. Requiring
+  both models to cross their thresholds removes most confident false calls; the
+  counts are stable for any secondary threshold in 0.50–0.70, so 0.65 is not a
+  knife-edge.
 
 The reference `invisible-watermark` encoder only marks the U channel (its
 `scales` list suggests U and V, but the loop covers channels 0–1), and OpenCV
@@ -330,13 +335,20 @@ See `config.json.template`. Key points:
   no separate shared library is needed at runtime, but builds are larger and
   slower.
 - `detect.classifier` is the optional AI-image classifier. Run
-  `scripts/fetch-classifier.sh models` once (about 93 MB); if the model is
-  missing, the detector is skipped. `threshold` defaults to 0.95, `ai_label`
-  selects the "artificial" output index (0 for the bundled Swin model). The
+  `scripts/fetch-classifier.sh models` once (about 180 MB); if a model is
+  missing, that model is skipped. The primary model's fields stay flat for
+  compatibility (`model_path`, `input_size`, `ai_label`, `threshold`); the
+  optional `secondary` object configures a second, independently trained model,
+  and `require_agreement` (default `true`) requires both to cross their own
+  thresholds. If the secondary is configured but missing, `require_agreement`
+  suppresses the classifier rather than silently falling back to one model.
+  Each model has its own preprocessing: `resize_shortest` (resize the shortest
+  edge, then centre crop) and `normalization` (`imagenet` or `clip`). The
   classifier runs only when the structured detectors found nothing, and skips
-  camera photos and images with an extreme aspect ratio. The model
-  (`SMOGY/SMOGY-Ai-images-detector`, converted by `onnx-community`) is
-  CC-BY-NC-4.0 and is downloaded, not redistributed.
+  tiny images and extreme aspect ratios. Both models are downloaded, not
+  redistributed: the primary (`SMOGY/SMOGY-Ai-images-detector`, converted by
+  `onnx-community`) is CC-BY-NC-4.0; the secondary (`fev`/Community Forensics
+  ViT-S/16) is MIT.
 - `detect.fingerprint` is the low-confidence exact-size heuristic. It is on by
   default; set it to `false` to suppress its 30-point signals.
 - `DASHBOARD_TOKEN` enables `wikimisc` telemetry (component `bot` or `web`);
@@ -390,19 +402,37 @@ On the 2026-11 Commons snapshot (76 files, all declared AI):
 | --- | --- | --- |
 | Full metadata | 76/76 | the description detector catches categories/templates |
 | Bytes only, before the classifier | 25/76 | C2PA/XMP/PNG text/EXIF only |
-| Bytes only, now | 62/76 (82%) | adds 35 classifier and 1 generator-size signal |
+| Bytes only, primary classifier | 62/76 (82%) | adds 35 classifier and 1 generator-size signal |
+| Bytes only, two-model agreement | 59/76 (78%) | 32 classifier signals; the secondary model rejects three clear AI images |
 
-The 14 byte-only misses are almost all LLM-generated charts and diagrams: the
+The 17 byte-only misses are almost all LLM-generated charts and diagrams: the
 classifier confidently considers them human-made, and no watermark survives.
-That is a known limitation, not a tuning problem.
+That is a known limitation, not a tuning problem. The three images lost to
+agreement are two AI cat photos and a Dall-E/Stable Diffusion comparison chart,
+which the secondary model scores as human-made.
 
-Negative control: 68 ordinary images from the Featured pictures, Quality images,
-Diagrams, Screenshots and Photographs categories. Five were flagged: three had
-C2PA/XMP saying they are AI-generated or AI-upscaled (label noise in the negative
-set), and two were classifier signals, one of them from the same AI-upscaled
-portrait series. The approximate false-positive rate is 1.5–3%. The fingerprint
-heuristic, the camera-EXIF/aspect gate, and the DWT generic threshold were tuned
-on this set.
+The hard-negative control is deliberately adversarial for the classifier: 182
+images from Featured pictures, Quality images, Diagrams, Screenshots,
+Photographs, portrait photographs, historical photographs, paintings and digital
+art. It contains scans, retouched photos and 3D renders.
+
+| Run | Flagged | Classifier signals |
+| --- | --- | --- |
+| Primary classifier | 30/182 | 21 |
+| Two-model agreement | 15/182 | 6 |
+
+The agreement rule cuts classifier false positives by 71% for three true
+positives. The six remaining classifier hits are mostly label noise in the
+negative set: a NARA portrait that both models call artificial, an AI-upscaled
+portrait, and two Mandelbulb 3D renders. The other hits on negatives come from
+C2PA/XMP/PNG text that genuinely declares AI or AI-upscaled provenance. A plain
+negative control of 68 ordinary images gives 4 classifier flags with the primary
+model and 1 with agreement.
+
+The fingerprint heuristic, the aspect-ratio guard, and the DWT generic threshold
+were tuned on these sets. Provenance gates that skipped images with camera or
+editing EXIF and PNG text were evaluated and removed: combined with two-model
+agreement they cost two true positives and saved only one false positive.
 
 The ToolsDB round-trip is opt-in because it needs the tunnel and credentials:
 
@@ -418,7 +448,7 @@ scripts/fetch-corpus.py --out /tmp/neg --per-category 15 \
     --category "Featured pictures on Wikimedia Commons" \
     --category "Quality images" --category "Diagrams" \
     --category "Screenshots" --category "Photographs"
-scripts/fetch-classifier.sh models          # optional, ~93 MB
+scripts/fetch-classifier.sh models          # optional, ~180 MB
 cargo run --release -- corpus /tmp/ai/index.json --bytes-only
 cargo run --release -- corpus /tmp/neg/index.json
 ```
@@ -444,7 +474,15 @@ scripts/fetch-classifier.sh /data/project/faike/models
 #   "store": {"kind": "toolsdb", "database": "s58339__faike_p"}
 #   "detect": {
 #     "watermark": {"models_dir": "/data/project/faike/models"},
-#     "classifier": {"model_path": "/data/project/faike/models/ai-image-detector.onnx"}
+#     "classifier": {
+#       "model_path": "/data/project/faike/models/ai-image-detector.onnx",
+#       "secondary": {
+#         "model_path": "/data/project/faike/models/ai-image-detector-commfor.onnx",
+#         "input_size": 384, "ai_label": null, "threshold": 0.65,
+#         "resize_shortest": 440, "normalization": "clip"
+#       },
+#       "require_agreement": true
+#     }
 #   }
 ```
 
@@ -478,8 +516,9 @@ still works and both ONNX detectors are skipped.
 1. Additional watermark decoders: Stable Signature/VideoSeal, SynthID where an
    API/credential is available, and additional TrustMark schemas.
 2. Visible watermark/logo and OCR signals, plus a "vendor badge" detector.
-3. Optional neural classifiers, clearly labelled probabilistic and never used
-   for `disallow`.
+3. A classifier or VLM for AI-generated charts and diagrams, the dominant
+   remaining byte-only miss; keep it probabilistic and never use it for
+   `disallow`.
 4. Video/audio: sample frames/audio, reuse the image/watermark detectors.
 5. An on-wiki bot mode that tags/notifies, and a public report page.
 6. C2PA trust-list validation and trust-state display (currently only
