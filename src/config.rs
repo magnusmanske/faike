@@ -129,28 +129,66 @@ pub struct DetectConfig {
     pub watermark: WatermarkConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Normalization {
+    #[default]
+    Imagenet,
+    Clip,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClassifierModelConfig {
+    /// ONNX image classifier. Not bundled; see `scripts/fetch-classifier.sh`.
+    pub model_path: PathBuf,
+    /// Square input size.
+    pub input_size: u32,
+    /// Output index of the AI-generated class; `None` for a single-logit model.
+    pub ai_label: Option<usize>,
+    /// Probability above which this model votes for AI.
+    pub threshold: f64,
+    /// Resize the shortest edge to this before a centre crop to `input_size`.
+    /// `None` stretches directly to `input_size`.
+    pub resize_shortest: Option<u32>,
+    pub normalization: Normalization,
+}
+
+impl Default for ClassifierModelConfig {
+    fn default() -> Self {
+        Self {
+            model_path: PathBuf::from("models/ai-image-detector.onnx"),
+            input_size: 224,
+            ai_label: Some(0),
+            threshold: 0.95,
+            resize_shortest: None,
+            normalization: Normalization::Imagenet,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ClassifierConfig {
     pub enabled: bool,
-    /// ONNX image classifier. Not bundled; see `scripts/fetch-classifier.sh`.
-    pub model_path: PathBuf,
-    /// Square input size. The bundled Swin model uses 224.
-    pub input_size: u32,
-    /// Output index of the AI-generated class.
-    pub ai_label: usize,
-    /// Probability above which the classifier reports a Medium signal.
-    pub threshold: f64,
+    /// The first model; its fields stay flat in the config for compatibility.
+    #[serde(flatten)]
+    pub primary: ClassifierModelConfig,
+    /// An optional second, independently trained model. Only enable it when
+    /// both model files are present; with `require_agreement`, a missing
+    /// secondary model disables the classifier rather than falling back.
+    pub secondary: Option<ClassifierModelConfig>,
+    /// Require both models to cross their thresholds.
+    pub require_agreement: bool,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            model_path: PathBuf::from("models/ai-image-detector.onnx"),
-            input_size: 224,
-            ai_label: 0,
-            threshold: 0.95,
+            primary: ClassifierModelConfig::default(),
+            secondary: None,
+            require_agreement: true,
         }
     }
 }
@@ -247,8 +285,16 @@ impl Config {
             .clamp(0.0, 1.0);
         self.detect.watermark.dwt_lock_threshold =
             self.detect.watermark.dwt_lock_threshold.clamp(0.0, 1.0);
-        self.detect.classifier.input_size = self.detect.classifier.input_size.clamp(64, 1024);
-        self.detect.classifier.threshold = self.detect.classifier.threshold.clamp(0.0, 1.0);
+
+        let primary = &mut self.detect.classifier.primary;
+        primary.input_size = primary.input_size.clamp(64, 1024);
+        primary.threshold = primary.threshold.clamp(0.0, 1.0);
+        primary.resize_shortest = primary.resize_shortest.map(|size| size.clamp(64, 2048));
+        if let Some(secondary) = &mut self.detect.classifier.secondary {
+            secondary.input_size = secondary.input_size.clamp(64, 1024);
+            secondary.threshold = secondary.threshold.clamp(0.0, 1.0);
+            secondary.resize_shortest = secondary.resize_shortest.map(|size| size.clamp(64, 2048));
+        }
     }
 
     /// Checks needed before starting the watcher. The web server itself can run
