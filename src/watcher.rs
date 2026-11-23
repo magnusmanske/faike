@@ -18,6 +18,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Shorter pause between cycles when an API reported more pages.
 const MORE_WORK_PAUSE: Duration = Duration::from_secs(1);
@@ -31,6 +32,9 @@ struct Job {
 }
 
 pub async fn run(config: Arc<Config>, store: Arc<Store>, status: Arc<Status>) {
+    // Downloads can overlap, but detector runs are the memory peak; keep them
+    // serial unless explicitly raised.
+    let analyses = Arc::new(Semaphore::new(config.analysis_concurrency));
     loop {
         if let Err(error) = store.refresh_wikis().await {
             status.set_error(format!("Wiki list refresh failed: {error:#}"));
@@ -40,7 +44,7 @@ pub async fn run(config: Arc<Config>, store: Arc<Store>, status: Arc<Status>) {
         telemetry::set_wikis(wikis.len());
         let mut more_work = false;
         for wiki in wikis.into_iter().filter(|wiki| wiki.enabled) {
-            match poll_wiki(&config, &store, &status, &wiki).await {
+            match poll_wiki(&config, &store, &status, &analyses, &wiki).await {
                 Ok(more) => more_work |= more,
                 Err(error) => {
                     status.set_wiki_error(&wiki.domain, format!("{error:#}"));
@@ -63,11 +67,12 @@ async fn poll_wiki(
     config: &Arc<Config>,
     store: &Arc<Store>,
     status: &Arc<Status>,
+    analyses: &Arc<Semaphore>,
     wiki: &Wiki,
 ) -> Result<bool> {
     let client = ApiClient::new(config, wiki)?;
     let mut cursor = store.load_cursor(&wiki.domain).await;
-    poll_once(config, &client, store, status, wiki, &mut cursor).await
+    poll_once(config, &client, store, status, analyses, wiki, &mut cursor).await
 }
 
 async fn poll_once(
@@ -75,6 +80,7 @@ async fn poll_once(
     client: &ApiClient,
     store: &Arc<Store>,
     status: &Arc<Status>,
+    analyses: &Arc<Semaphore>,
     wiki: &Wiki,
     cursor: &mut Option<Cursor>,
 ) -> Result<bool> {
@@ -89,7 +95,7 @@ async fn poll_once(
             );
         }
         if !batch.uploads.is_empty() {
-            process_batch(config, client, store, status, wiki, batch.uploads).await?;
+            process_batch(config, client, store, status, analyses, wiki, batch.uploads).await?;
         }
         if let Some(new_cursor) = &batch.cursor {
             store.save_cursor(&wiki.domain, new_cursor).await?;
@@ -113,7 +119,7 @@ async fn poll_once(
     let uploads = batch.uploads.len();
     if !batch.uploads.is_empty() {
         eprintln!("faike: {uploads} upload event(s) on {}", wiki.domain);
-        process_batch(config, client, store, status, wiki, batch.uploads).await?;
+        process_batch(config, client, store, status, analyses, wiki, batch.uploads).await?;
     }
     if let Some(new_cursor) = &batch.cursor
         && *new_cursor > current
@@ -132,6 +138,7 @@ async fn process_batch(
     client: &ApiClient,
     store: &Arc<Store>,
     status: &Arc<Status>,
+    analyses: &Arc<Semaphore>,
     wiki: &Wiki,
     events: Vec<UploadEvent>,
 ) -> Result<()> {
@@ -197,6 +204,7 @@ async fn process_batch(
                     client.clone(),
                     store.clone(),
                     status.clone(),
+                    analyses.clone(),
                     wiki.domain.clone(),
                     job,
                 )
@@ -219,6 +227,7 @@ async fn analyze_job(
     client: ApiClient,
     store: Arc<Store>,
     status: Arc<Status>,
+    analyses: Arc<Semaphore>,
     wiki: String,
     job: Job,
 ) -> Result<()> {
@@ -260,6 +269,12 @@ async fn analyze_job(
         );
     }
 
+    // Pixel detectors keep full-resolution planes resident; bound them
+    // independently of how many downloads are in flight.
+    let _permit = analyses
+        .acquire_owned()
+        .await
+        .context("Analysis semaphore closed")?;
     let detect_config = config.detect.clone();
     let mime = job.info.mime.clone();
     let metadata = job.metadata;

@@ -244,13 +244,16 @@ fn block_scores(image: &RgbImage) -> Option<Vec<BlockVote>> {
     if crop_width < 8 || crop_height < 8 {
         return None;
     }
-    let mut u = vec![0f64; crop_width * crop_height];
+    // `f32` is exact for the integer U plane and ample for the Haar sum.
+    // Full-resolution planes are the largest per-image allocation, so saving
+    // half of it matters for the job's memory budget.
+    let mut u = vec![0f32; crop_width * crop_height];
     for y in 0..crop_height {
         for x in 0..crop_width {
             let pixel = image.get_pixel(x as u32, y as u32);
-            let r = f64::from(pixel[0]);
-            let g = f64::from(pixel[1]);
-            let b = f64::from(pixel[2]);
+            let r = f32::from(pixel[0]);
+            let g = f32::from(pixel[1]);
+            let b = f32::from(pixel[2]);
             let index = y * crop_width + x;
             // OpenCV converts to uint8 YUV with rounding. Keeping the
             // fractional value shifts many block coefficients across the
@@ -267,13 +270,13 @@ fn block_scores(image: &RgbImage) -> Option<Vec<BlockVote>> {
 }
 
 /// One-level 2D Haar low-pass: `(a+b+c+d)/2` for each 2×2 block.
-fn haar_ll(plane: &[f64], width: usize, height: usize) -> Option<(Vec<f64>, usize, usize)> {
+fn haar_ll(plane: &[f32], width: usize, height: usize) -> Option<(Vec<f32>, usize, usize)> {
     if width < 2 || height < 2 || plane.len() < width * height {
         return None;
     }
     let out_width = width / 2;
     let out_height = height / 2;
-    let mut out = vec![0f64; out_width * out_height];
+    let mut out = vec![0f32; out_width * out_height];
     for y in 0..out_height {
         let row0 = 2 * y * width;
         let row1 = row0 + width;
@@ -289,7 +292,7 @@ fn haar_ll(plane: &[f64], width: usize, height: usize) -> Option<(Vec<f64>, usiz
     Some((out, out_width, out_height))
 }
 
-fn collect_block_scores(ll: &[f64], width: usize, height: usize, out: &mut Vec<BlockVote>) {
+fn collect_block_scores(ll: &[f32], width: usize, height: usize, out: &mut Vec<BlockVote>) {
     let blocks_x = width / BLOCK;
     let blocks_y = height / BLOCK;
     for block_y in 0..blocks_y {
@@ -309,7 +312,8 @@ fn collect_block_scores(ll: &[f64], width: usize, height: usize, out: &mut Vec<B
                     }
                 }
             }
-            let value = ll[max_index].abs();
+            // The vote arithmetic stays in f64; only the large planes shrink.
+            let value = f64::from(ll[max_index].abs());
             let remainder = value % SCALE;
             let distance = (remainder - 0.25 * SCALE)
                 .abs()
@@ -370,10 +374,10 @@ mod tests {
 
     #[test]
     fn haar_low_pass_of_a_constant_plane() {
-        let plane = vec![100.0; 8 * 8];
+        let plane = vec![100.0f32; 8 * 8];
         let (ll, width, height) = haar_ll(&plane, 8, 8).unwrap();
         assert_eq!((width, height), (4, 4));
-        assert!(ll.iter().all(|value| (*value - 200.0).abs() < f64::EPSILON));
+        assert!(ll.iter().all(|value| (*value - 200.0).abs() < f32::EPSILON));
     }
 
     fn votes(bits: &[u8], distance: f64) -> Vec<BlockVote> {

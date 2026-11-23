@@ -13,6 +13,8 @@
 
   "max_download_bytes": 67108864,
   "download_concurrency": 2,
+  "//analysis_concurrency": "Detector runs at once. Pixel analysis peaks around 600 MB per 24 MP image; keep this low and raise the job memory before raising it.",
+  "analysis_concurrency": 1,
   "download_mime_prefixes": ["image/"],
 
   "min_score": 30,

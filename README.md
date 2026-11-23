@@ -325,6 +325,9 @@ See `config.json.template`. Key points:
   wiki** (default 50). `0` starts at the current time.
 - `download_mime_prefixes` defaults to `["image/"]`; files outside it still get
   metadata/wikitext analysis.
+- `download_concurrency` (default 2) overlaps HTTP downloads.
+  `analysis_concurrency` (default 1) bounds detector runs, which are the memory
+  peak. Keep it at 1 unless the job memory is raised as well.
 - `max_download_bytes` bounds memory and bandwidth; oversized files are
   metadata-only.
 - `store` selects where detections go. `kind: "file"` uses `file` and
@@ -512,11 +515,14 @@ the ToolsDB replica and reloads every five seconds, so it does not compete with
 the bot for the primary. The models and ONNX Runtime are large, so the build and
 image are larger than a metadata-only deployment.
 
-The bot job needs **2 GiB**, not 1 GiB: pixel analysis keeps several
-full-resolution planes alive, and one 24 MP image peaks around 540 MB. With
-two concurrent downloads (the default), a 1 GiB limit is OOM-killed as soon as
-a batch contains two large photos, and the cursor makes it retry the same batch
-in a crash loop. `restart.sh` therefore requests `--mem 2Gi`; the tool quota
+The bot job needs **3 GiB**. The two ONNX classifiers and the TrustMark
+models stay resident for the life of the process, and one 24 MP image still
+peaks around 600 MB after the DWT planes were narrowed to `f32`. The OS
+also retains some of that working set between runs. Detector runs are therefore
+serialised by `analysis_concurrency` (default 1), independently of the two
+concurrent downloads; running two large analyses at once was what pushed the
+old 2 GiB job over its cgroup limit and got it OOM-killed, with the cursor
+then retrying the same batch. `restart.sh` requests `--mem 3Gi`; the tool quota
 allows up to 6 GiB per job.
 
 If the build service cannot download the ONNX Runtime binaries used by

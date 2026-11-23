@@ -50,6 +50,7 @@ mod enabled {
     use image::GenericImageView;
     use image::imageops::FilterType;
     use ndarray::Array4;
+    use ort::execution_providers::CPUExecutionProvider;
     use ort::session::{Session, builder::GraphOptimizationLevel};
     use ort::value::{TensorValueType, Value};
     use std::sync::{Mutex, OnceLock};
@@ -86,6 +87,12 @@ mod enabled {
             }
             return None;
         }
+        // A long-lived bot runs the same fixed shapes for days. ONNX Runtime's
+        // default CPU arena keeps growing and fragments; without it each run
+        // returns its intermediate buffers, which suits this low-volume job.
+        let cpu = CPUExecutionProvider::default()
+            .with_arena_allocator(false)
+            .build();
         let session = Session::builder()
             .ok()
             .and_then(|builder| {
@@ -94,6 +101,7 @@ mod enabled {
                     .ok()
             })
             .and_then(|builder| builder.with_intra_threads(2).ok())
+            .and_then(|builder| builder.with_execution_providers([cpu]).ok())
             .and_then(|builder| builder.commit_from_file(&config.model_path).ok());
         match session {
             Some(session) => {

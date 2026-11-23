@@ -32,7 +32,12 @@ pub fn detect(input: &Input, config: &WatermarkConfig) -> Vec<Signal> {
     };
     let mut signals = Vec::new();
     if config.dwt_dct {
-        signals.extend(dwt_dct::detect(&image.to_rgb8(), config));
+        // Most uploads are RGB JPEGs; borrowing avoids a full-resolution copy.
+        if let Some(rgb) = image.as_rgb8() {
+            signals.extend(dwt_dct::detect(rgb, config));
+        } else {
+            signals.extend(dwt_dct::detect(&image.to_rgb8(), config));
+        }
     }
     if config.trustmark {
         signals.extend(trustmark::detect(image, config));

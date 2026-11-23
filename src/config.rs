@@ -19,6 +19,9 @@ pub struct Config {
     pub max_download_bytes: u64,
     /// Concurrent file downloads.
     pub download_concurrency: usize,
+    /// Concurrent detector runs. Pixel analysis is memory-heavy, so this stays
+    /// low even when downloads overlap.
+    pub analysis_concurrency: usize,
     /// Only download these MIME prefixes. Metadata is still analysed for all.
     pub download_mime_prefixes: Vec<String>,
     /// Minimum score stored and shown.
@@ -52,6 +55,7 @@ impl Default for Config {
             max_batch: 500,
             max_download_bytes: 64 * 1024 * 1024,
             download_concurrency: 2,
+            analysis_concurrency: 1,
             download_mime_prefixes: vec!["image/".to_string()],
             min_score: 30,
             abuse_filter_min_score: 80,
@@ -270,6 +274,7 @@ impl Config {
         self.poll_interval_sec = self.poll_interval_sec.max(1);
         self.max_batch = self.max_batch.clamp(1, 500);
         self.download_concurrency = self.download_concurrency.clamp(1, 8);
+        self.analysis_concurrency = self.analysis_concurrency.clamp(1, 8);
         self.min_score = self.min_score.min(100);
         self.abuse_filter_min_score = self.abuse_filter_min_score.min(100);
         self.max_records = self.max_records.max(1);
@@ -362,12 +367,13 @@ mod tests {
     #[test]
     fn values_are_clamped() {
         let mut config: Config = serde_json::from_str(
-            r#"{"max_batch": 9999, "download_concurrency": 0, "min_score": 200}"#,
+            r#"{"max_batch": 9999, "download_concurrency": 0, "analysis_concurrency": 0, "min_score": 200}"#,
         )
         .unwrap();
         config.clamp();
         assert_eq!(config.max_batch, 500);
         assert_eq!(config.download_concurrency, 1);
+        assert_eq!(config.analysis_concurrency, 1);
         assert_eq!(config.min_score, 100);
     }
 
